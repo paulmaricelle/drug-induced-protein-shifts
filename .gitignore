@@ -1,0 +1,46 @@
+# =====================================================================
+# Données cliniques et fichiers lourds (STARR, UKB)
+# =====================================================================
+data/
+*.parquet
+*.feather
+*.arrow
+*.csv.gz
+manifest*.parquet
+candidate_pairs*.parquet
+
+# =====================================================================
+# Embeddings, modèles et checkpoints binaires
+# =====================================================================
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.ckpt
+models/
+checkpoints/
+
+# =====================================================================
+# Logs et traces d'exécution
+# =====================================================================
+logs/
+*.log
+*.out
+*.err
+wandb/
+
+# =====================================================================
+# Environnements virtuels et caches
+# =====================================================================
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+.env
