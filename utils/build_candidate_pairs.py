@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from the_map.cohort_extractor import DrugCohort
+from src.cohort_extractor import DrugCohort
 
 COHORTS_DIR = Path("data/cohorts")
 MANIFEST_PATH = COHORTS_DIR / "manifest.parquet"

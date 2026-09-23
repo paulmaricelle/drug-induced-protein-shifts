@@ -10,9 +10,9 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from the_map.config import PathConfig, ProtocolConfig
-from the_map.drugCatalog import DrugCatalog
-from the_map.cohort_extractor import CohortExtractor
+from src.config import PathConfig, ProtocolConfig
+from src.catalog.catalog import DrugCatalog
+from src.cohort_extractor import CohortExtractor
 
 
 def run_batch_extraction(
