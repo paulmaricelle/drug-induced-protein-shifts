@@ -88,6 +88,8 @@ def build_theoretical_drug_catalog(
     """Compile le catalogue théorique complet en projetant vp vers ua
 
     selon la formule du protocole : u_a = sum_p w_ap * sigma_ap * v_p.
+    Les poids w_ap conservent leur magnitude pharmacologique absolue
+    (pas de division par la somme des scores).
     """
     output_catalog_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Chargement de la matrice des cibles depuis {vp_parquet_path.name}...")
@@ -170,13 +172,8 @@ def build_theoretical_drug_catalog(
             mechanisms = []
             uids = []
         else:
-            # Normalisation relative des poids : sum_p w_ap = 1.0
-            sum_scores = sum(scores)
-            weights = (
-                [s / sum_scores for s in scores]
-                if sum_scores > 0
-                else [1.0 / len(valid_targets)] * len(valid_targets)
-            )
+            # Poids absolus non normalisés : w_ap conserve l'échelle d'affinité
+            weights = [float(s) for s in scores]
 
             ua = np.zeros(dim_vp, dtype=np.float32)
             targets_struct = []

@@ -33,7 +33,12 @@ class PathConfig:
 
   mapping_path: Path = ROOT_DIR / "data" / "ingredient_to_prescriptions.parquet"
   catalog_path: Path = ROOT_DIR / "data" / "catalog" / "drug_catalog.jsonl"
-  output_cohorts_dir: Path = ROOT_DIR / "data" / "cohorts"
+
+  @property
+  def output_cohorts_dir(self) -> Path:
+    # Cohortes échantillon séparées pour ne jamais polluer la production
+    sub = "cohorts_benchmark" if self.is_sample else "cohorts"
+    return self.root_dir / "data" / sub
 
   @property
   def cache_dir(self) -> Path:

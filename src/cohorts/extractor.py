@@ -42,6 +42,27 @@ class CohortExtractor:
           f"Exécutez : python3 scripts/build_cache.py --ratio 1.0"
       )
 
+    # Détection d'un cache obsolète (généré par une ancienne version de build_cache.py)
+    required_cols = {
+        "person_id", "drug_concept_id", "exp_date", "ingredient_id",
+        "is_monotherapy",
+    }
+    found_cols = {
+        row[0]
+        for row in self.con.execute(
+            "SELECT name FROM parquet_schema(?)",
+            [str(paths.drug_exposure_parquet)],
+        ).fetchall()
+    }
+    missing = required_cols - found_cols
+    if missing:
+      ratio = "0.2" if paths.is_sample else "1.0"
+      raise RuntimeError(
+          f"Cache obsolète : colonnes {sorted(missing)} absentes de"
+          f" {paths.drug_exposure_parquet}.\n"
+          f"Régénérez-le : python3 scripts/build_cache.py --ratio {ratio}"
+      )
+
     print(
         f"Chargement du cache OMOP ({paths.cache_dir.name}) en mémoire"
         " DuckDB..."

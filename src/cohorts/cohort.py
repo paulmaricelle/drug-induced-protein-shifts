@@ -259,8 +259,11 @@ class DrugCohort:
 
         # Rechargement des tables d'outcomes cliniques
         labs_file = path / "stanford_labs.parquet"
+        alt_labs_file = path / "biomarkers.parquet"
         if labs_file.exists():
             cohort.stanford_labs = pl.read_parquet(labs_file)
+        elif alt_labs_file.exists():
+            cohort.stanford_labs = pl.read_parquet(alt_labs_file)
 
         # Rechargement des tenseurs
         if (path / "stanford_motor_z0.npy").exists():
@@ -423,47 +426,52 @@ class DrugCohort:
         self,
         k: int = 3,
         source: Literal["stanford", "ukb"] = "stanford",
+        whitener: MotorWhitener | None = None,
         force_recompute: bool = False,
         random_state: int = 42,
     ) -> np.ndarray:
-        """Calcule ou charge k prototypes cliniques L2-normalisés dans l'espace MOTOR (768-d).
+      """Calcule ou charge k prototypes cliniques L2-normalisés dans l'espace MOTOR (768-d).
 
-        Gère automatiquement le cas où l'effectif N <= k en prenant chaque patient
-        comme son propre prototype.
-        """
-        reps = (
-            self._stanford_motor_z0
-            if source == "stanford"
-            else self._ukb_motor_z0
+      Si un whitener est fourni, le clustering k-means est entraîné sur les
+      représentations blanchies (Section 4.2 du protocole).
+      """
+      reps = (
+          self._stanford_motor_z0
+          if source == "stanford"
+          else self._ukb_motor_z0
+      )
+      if reps is None:
+        raise ValueError(
+            f"Représentations MOTOR z0 non chargées pour la source '{source}'."
         )
-        if reps is None:
-            raise ValueError(
-                f"Représentations MOTOR z0 non chargées pour la source '{source}'."
-            )
 
-        n_samples = reps.shape[0]
-        if n_samples == 0:
-            raise ValueError(
-                f"Cohorte {self.drug_id} ({self.name}) vide : impossible de calculer des prototypes."
-            )
+      n_samples = reps.shape[0]
+      if n_samples == 0:
+        raise ValueError(
+            f"Cohorte {self.drug_id} ({self.name}) vide : impossible de"
+            " calculer des prototypes."
+        )
 
-        # K-Means adaptatif
-        if n_samples <= k:
-            raw_prototypes = reps.copy()
-        else:
-            kmeans = KMeans(
-                n_clusters=k,
-                random_state=random_state,
-                n_init="auto",
-            )
-            kmeans.fit(reps)
-            raw_prototypes = kmeans.cluster_centers_.astype(np.float32)
+      # 1. Blanchiment conditionnel pour le clustering k-means
+      cluster_input = reps if whitener is None else whitener.transform(reps)
 
-        # Normalisation L2 stricte pour optimiser le calcul cosinus
-        norms = np.linalg.norm(raw_prototypes, axis=1, keepdims=True)
-        self._prototypes = raw_prototypes / np.maximum(norms, 1e-8)
+      # 2. K-Means adaptatif
+      if n_samples <= k:
+        raw_prototypes = cluster_input.copy()
+      else:
+        kmeans = KMeans(
+            n_clusters=k,
+            random_state=random_state,
+            n_init="auto",
+        )
+        kmeans.fit(cluster_input)
+        raw_prototypes = kmeans.cluster_centers_.astype(np.float32)
 
-        return self._prototypes
+      # 3. Normalisation L2 stricte pour la distance cosinus min-linkage
+      norms = np.linalg.norm(raw_prototypes, axis=1, keepdims=True)
+      self._prototypes = raw_prototypes / np.maximum(norms, 1e-8)
+
+      return self._prototypes
 
     # -------------------------------------------------------------------------
     # Distance Inter-Cohortes (Min-Linkage Cosinus)
@@ -553,3 +561,54 @@ class DrugCohort:
             f"<DrugCohort id={self.drug_id} name='{self.name}' kind='{self.kind}' "
             f"(N_stanford={self.n_stanford:,}, N_ukb={self.n_ukb:,}{proto_str})>"
         )
+
+
+class MotorWhitener:
+  """Opérateur de blanchiment de Mahalanobis / ZCA pour l'espace MOTOR (Section 4.2).
+
+  Transforme z en z_tilde = (z - mu) @ W_whitening pour annuler les corrélations
+  croisées et normaliser les variances directionnelles sur la population de
+  référence.
+  """
+
+  def __init__(
+      self,
+      mean: np.ndarray,
+      whitening_matrix: np.ndarray,
+  ):
+    self.mean = mean.astype(np.float32)  # (768,)
+    self.W = whitening_matrix.astype(np.float32)  # (768, 768)
+
+  @classmethod
+  def fit_from_embeddings(
+      cls,
+      embeddings: np.ndarray,
+      eps: float = 1e-5,
+  ) -> MotorWhitener:
+    """Calibre l'opérateur de blanchiment ZCA sur un échantillon représentatif de MOTOR (N, 768)."""
+    mu = np.mean(embeddings, axis=0)
+    centered = embeddings - mu
+    n = centered.shape[0]
+
+    cov = (centered.T @ centered) / (n - 1)
+    # Décomposition spectrale : cov = U @ diag(S) @ U.T
+    evals, evecs = np.linalg.eigh(cov)
+
+    # Inversion régularisée des valeurs propres
+    inv_sqrt_evals = 1.0 / np.sqrt(np.maximum(evals, eps))
+    # Whitening ZCA : préserve l'orientation spatiale globale au plus proche de l'original
+    W = evecs @ np.diag(inv_sqrt_evals) @ evecs.T
+
+    return cls(mean=mu, whitening_matrix=W)
+
+  def transform(self, z: np.ndarray) -> np.ndarray:
+    """Applique le blanchiment : z_tilde = (z - mu) @ W."""
+    return (z - self.mean) @ self.W
+
+  def save(self, filepath: str | Path) -> None:
+    np.savez_compressed(filepath, mean=self.mean, W=self.W)
+
+  @classmethod
+  def load(cls, filepath: str | Path) -> MotorWhitener:
+    data = np.load(filepath)
+    return cls(mean=data["mean"], whitening_matrix=data["W"])

@@ -421,54 +421,88 @@ def compute_gtex_embeddings(
     )
     return df
 
+# src/catalog/protein_features.py (fonction assemble_target_features_vp)
+
+
 def assemble_target_features_vp(
     features_dir: Path,
     output_parquet: Path,
 ) -> pl.DataFrame:
-    """
-    Joint les 4 modalités (ESM-2, Reactome, STRING, GTEx), concatène en 1590-d
-    et applique la normalisation L2 : v_p = v_p / ||v_p||_2.
-    """
-    output_parquet.parent.mkdir(parents=True, exist_ok=True)
-    print("Assemblage final du vecteur multi-omique v_p (1 590 dimensions)...")
+  """Joint les 4 modalités (ESM-2, Reactome, STRING, GTEx), applique une
 
-    # 1. Chargement des 4 tables
-    esm = pl.read_parquet(features_dir / "esm2_embeddings.parquet")
-    react = pl.read_parquet(features_dir / "reactome_embeddings.parquet")
-    string = pl.read_parquet(features_dir / "string_embeddings.parquet")
-    gtex = pl.read_parquet(features_dir / "gtex_embeddings.parquet")
+  normalisation L2 intra-bloc pour équilibrer les représentations, concatène en
+  1590-d et applique la normalisation L2 finale : v_p = v_p / ||v_p||_2.
+  """
+  output_parquet.parent.mkdir(parents=True, exist_ok=True)
+  print(
+      "Assemblage final du vecteur multi-omique v_p (1 590 dimensions avec"
+      " équilibrage intra-bloc)..."
+  )
 
-    # 2. Jointures strictes sur uniprot_id
-    merged = (
-        esm.join(react, on="uniprot_id", how="inner")
-        .join(string, on="uniprot_id", how="inner")
-        .join(gtex, on="uniprot_id", how="inner")
-        .sort("uniprot_id")
-    )
+  # 1. Chargement des 4 tables
+  esm = pl.read_parquet(features_dir / "esm2_embeddings.parquet")
+  react = pl.read_parquet(features_dir / "reactome_embeddings.parquet")
+  string = pl.read_parquet(features_dir / "string_embeddings.parquet")
+  gtex = pl.read_parquet(features_dir / "gtex_embeddings.parquet")
 
-    uids = merged["uniprot_id"].to_list()
-    
-    # 3. Concaténation matricielle NumPy
-    mat_esm = np.array(merged["esm2_embedding"].to_list(), dtype=np.float32)       # (N, 1280)
-    mat_react = np.array(merged["reactome_embedding"].to_list(), dtype=np.float32) # (N, 128)
-    mat_string = np.array(merged["string_embedding"].to_list(), dtype=np.float32)  # (N, 128)
-    mat_gtex = np.array(merged["gtex_embedding"].to_list(), dtype=np.float32)      # (N, 54)
+  # 2. Jointures strictes sur uniprot_id
+  merged = (
+      esm.join(react, on="uniprot_id", how="inner")
+      .join(string, on="uniprot_id", how="inner")
+      .join(gtex, on="uniprot_id", how="inner")
+      .sort("uniprot_id")
+  )
 
-    vp_raw = np.hstack([mat_esm, mat_react, mat_string, mat_gtex])                 # (N, 1590)
+  uids = merged["uniprot_id"].to_list()
 
-    # 4. Normalisation L2 par ligne (Section 3.3 du protocole)
-    norms = np.linalg.norm(vp_raw, axis=1, keepdims=True)
-    vp_normed = vp_raw / np.maximum(norms, 1e-9)
+  # 3. Extraction NumPy des 4 blocs
+  mat_esm = np.array(
+      merged["esm2_embedding"].to_list(), dtype=np.float32
+  )  # (N, 1280)
+  mat_react = np.array(
+      merged["reactome_embedding"].to_list(), dtype=np.float32
+  )  # (N, 128)
+  mat_string = np.array(
+      merged["string_embedding"].to_list(), dtype=np.float32
+  )  # (N, 128)
+  mat_gtex = np.array(
+      merged["gtex_embedding"].to_list(), dtype=np.float32
+  )  # (N, 54)
 
-    # 5. Sauvegarde
-    df_vp = pl.DataFrame({
-        "uniprot_id": uids,
-        "vp": [vp_normed[i].tolist() for i in range(len(uids))],
-    })
-    
-    df_vp.write_parquet(output_parquet)
-    size_mb = output_parquet.stat().st_size / (1024 * 1024)
-    print(f"-> Matrice v_p finalisée : {output_parquet} ({size_mb:.2f} Mo, shape: {df_vp.shape})")
-    print(f"-> Dimension finale par cible : {len(df_vp['vp'][0])} (Norme L2 moyenne = {np.mean(np.linalg.norm(vp_normed, axis=1)):.4f})")
-    
-    return df_vp
+  # 4. Normalisation L2 intra-bloc (évite la dominance mécanique d'ESM-2 à 80%)
+  norm_esm = np.maximum(np.linalg.norm(mat_esm, axis=1, keepdims=True), 1e-9)
+  norm_react = np.maximum(
+      np.linalg.norm(mat_react, axis=1, keepdims=True), 1e-9
+  )
+  norm_string = np.maximum(
+      np.linalg.norm(mat_string, axis=1, keepdims=True), 1e-9
+  )
+  norm_gtex = np.maximum(np.linalg.norm(mat_gtex, axis=1, keepdims=True), 1e-9)
+
+  mat_esm_norm = mat_esm / norm_esm
+  mat_react_norm = mat_react / norm_react
+  mat_string_norm = mat_string / norm_string
+  mat_gtex_norm = mat_gtex / norm_gtex
+
+  # Concaténation multi-omique équilibrée (N, 1590)
+  vp_raw = np.hstack(
+      [mat_esm_norm, mat_react_norm, mat_string_norm, mat_gtex_norm]
+  )
+
+  # 5. Normalisation L2 unitaire finale par ligne : ||v_p||_2 = 1.0
+  norms_total = np.maximum(np.linalg.norm(vp_raw, axis=1, keepdims=True), 1e-9)
+  vp_normed = vp_raw / norms_total
+
+  # 6. Sauvegarde
+  df_vp = pl.DataFrame({
+      "uniprot_id": uids,
+      "vp": [vp_normed[i].tolist() for i in range(len(uids))],
+  })
+
+  df_vp.write_parquet(output_parquet)
+  size_mb = output_parquet.stat().st_size / (1024 * 1024)
+  print(
+      f"-> Matrice v_p finalisée : {output_parquet} ({size_mb:.2f} Mo, shape:"
+      f" {df_vp.shape})"
+  )
+  return df_vp

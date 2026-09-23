@@ -182,7 +182,7 @@ def run_batch_biomarker_extraction(min_n: int = 1) -> None:
         cid = sub_df["drug_id"][0]
         out_dir = paths.output_cohorts_dir / f"cohort_{cid}"
         if out_dir.exists():
-            sub_df.drop("drug_id").write_parquet(out_dir / "biomarkers.parquet")
+            sub_df.drop("drug_id").write_parquet(out_dir / "stanford_labs.parquet")
             cohorts_written += 1
 
     # Synthèse globale exportée

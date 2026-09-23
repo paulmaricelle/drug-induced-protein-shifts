@@ -17,9 +17,13 @@ import duckdb
 from src.config import PathConfig
 
 # Concepts cibles du protocole
+# scripts/cache_biomarkers.py (extrait de TARGET_CONCEPTS)
+
+# Concepts cibles du protocole
 TARGET_CONCEPTS = [
     # LDL Cholesterol
     3028288,
+    3027597,  # Ajout : concept LDL ciblé par extract_biomarkers.py
     3027114,
     3013444,
     3025809,
