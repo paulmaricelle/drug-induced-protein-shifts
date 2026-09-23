@@ -42,13 +42,16 @@ def run_batch_extraction(
   catalog = DrugCatalog.load(paths.catalog_path)
   extractor = CohortExtractor(catalog=catalog, paths=paths, protocol=protocol)
 
-  # 2. Molécules cibles (monothérapies)
-  monotherapies = [item for item in catalog if item.kind == "monotherapy"]
-  target_ids = [item.drug_id for item in monotherapies]
+  # 2. Cibles : monothérapies puis bi-thérapies fixes
+  # (les de facto sont dérivées des passes monothérapie, cf. étape 5)
+  monotherapy_ids = [i.drug_id for i in catalog if i.kind == "monotherapy"]
+  fixed_ids = [i.drug_id for i in catalog if i.kind == "fixed_combination"]
 
   if limit is not None:
-    target_ids = target_ids[:limit]
-    print(f"Limitation active : premières {limit} molécules sélectionnées.")
+    monotherapy_ids = monotherapy_ids[:limit]
+    fixed_ids = fixed_ids[:limit]
+    print(f"Limitation active : premières {limit} molécules de chaque type.")
+  target_ids = monotherapy_ids + fixed_ids
 
   # 3. Gestion de la reprise
   already_extracted_ids = set()
@@ -70,14 +73,24 @@ def run_batch_extraction(
       )
 
   queue_ids = [cid for cid in target_ids if cid not in already_extracted_ids]
-  print(f"Cohortes monothérapies à traiter : {len(queue_ids):,}\n")
+  fixed_set = set(fixed_ids)
+  n_fixed_queued = sum(1 for cid in queue_ids if cid in fixed_set)
+  print(
+      f"Cohortes à traiter : {len(queue_ids) - n_fixed_queued:,} monothérapies"
+      f" + {n_fixed_queued:,} bi-thérapies fixes\n"
+  )
+  if resume and already_extracted_ids:
+    print(
+        "[Avertissement] Reprise : les bi-thérapies de facto ne sont collectées"
+        " que depuis les monothérapies traitées dans cette exécution.\n"
+    )
 
   manifest_records = []
   errors = []
   start_total = time.time()
 
   # 4. Boucle d'extraction vectorisée
-  pbar = tqdm(queue_ids, desc="Extraction monothérapies", unit="molécule")
+  pbar = tqdm(queue_ids, desc="Extraction mono + fixes", unit="cohorte")
   for cid in pbar:
     item = catalog.get(cid)
     pbar.set_postfix_str(f"ID {cid} ({item.name[:12]})")

@@ -31,7 +31,7 @@ python scripts/build_cache.py --ratio 1.0
 # 3. Cohorts. Defaults to the SAMPLE cache; --full is required for production
 python scripts/extract_cohorts.py --full [--limit N] [--no-resume]
 python scripts/audit_cohorts.py [--drugs ID ...]
-python scripts/sync_defacto_to_catalog.py  # adds de facto combos (cohort_9*) into drug_catalog.jsonl
+python scripts/sync_defacto_to_catalog.py  # replaces the catalog's de facto combos with those on disk (cohort_9*)
 
 # 4. Biomarkers (LDL, HbA1c, eGFR, ALT, CRP, SBP)
 python scripts/cache_biomarkers.py         # scans STARR measurement shards -> cache_full/biomarkers_measurements.parquet
@@ -61,7 +61,12 @@ To exercise a single drug, run `scripts/extract_cohorts.py --limit N`, run `audi
 
   Rows are tagged by `record_type` (0 = cohort, 1 = attrition counts, 2 = de facto rows). De facto pairs build up in memory across the batch and are exported at the end.
 - **`DrugCohort`** (`src/cohorts/cohort.py`) is saved to `<output_cohorts_dir>/cohort_<drug_id>/`. The folder holds `metadata.json` and `stanford_index.parquet` (person_id, t0, t_6m, t_12m, follow-up flags), plus `stanford_labs.parquet`, `biomarkers.parquet` and optional `.npy` tensors (MOTOR z0 768-d, RABIT deltas, UKB Olink, k-means prototypes). `data/cohorts/manifest.parquet` records one row per drug (`status` SAVED/ZERO_PATIENT, `n_final_stanford`). Downstream steps filter on `status == "SAVED" & n_final_stanford >= min_n`.
-- **De facto combination IDs** are synthetic: `md5("{min}_{max}")[:12] % 1e12 + 9_000_000_000_000`. The same formula appears in `extractor.py` and `catalog.py` and must stay in sync. Their folders match `cohort_9*`, which is how `register_de_facto_cohorts` / `sync_defacto_to_catalog.py` find them. For a combination, `u = u_A + u_B`, and the text embedding is the normalized mean of the two.
+- **Combination IDs** are synthetic 13-digit IDs computed only by `combo_drug_id()` in `src/catalog/catalog.py`. Fixed combinations get `8…` (folders `cohort_8*`) and de facto combinations get `9…` (folders `cohort_9*`, which `register_de_facto_cohorts` scans). The same ingredient pair can exist as both kinds, so the pair index is keyed by `(kind, pair)` (`DrugCatalog.get_combination`). Build combination items only with `DrugCatalog.build_combination_item`, which sets `u = u_A + u_B` and uses the normalized mean of the two text embeddings.
+- **What each cohort contains:**
+  - A *monotherapy* cohort has exactly one new ingredient at t0, taken as monotherapy.
+  - A *fixed combination* cohort starts at the first dispensing of the combined product, and its two ingredients are the only new ones at t0.
+  - A *de facto* cohort has exactly two new monotherapies at t0. It is built from the co-initiations collected during the two monotherapy passes, and a patient is kept only if **both** passes captured them, so that the washout covers the ATC4 classes of both ingredients.
+  - The washout of a combination covers the ATC4 families of both ingredients (`DrugCatalog.get_comparator_ids`).
 - **`src/pairs/`**: `CandidatePair` has a permutation-invariant key `(min_id, max_id, stratum_concept_id)`. `PairRegistry` merges method flags on that key (`by_indication`, `by_css`, `by_kmeans`, `by_atc4`), and consensus means at least two methods agree. Only Method 1 (shared diagnoses at t0, `indication_pairs.py`) and intra-ATC4 pairs are implemented.
 
 ## Gotchas

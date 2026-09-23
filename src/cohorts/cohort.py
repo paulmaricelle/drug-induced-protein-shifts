@@ -50,7 +50,7 @@ class DrugCohort:
         self.name = name or f"Drug_{self.drug_id}"
         self.kind = kind
         self.ingredient_concept_ids = ingredient_concept_ids or (
-            [self.drug_id] if self.drug_id > 0 else []
+            [self.drug_id] if kind == "monotherapy" else []
         )
 
         # ---------------------------------------------------------------------

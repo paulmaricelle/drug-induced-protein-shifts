@@ -1,13 +1,12 @@
 # src/cohorts/extractor.py
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 from typing import Optional
 import duckdb
 import polars as pl
 
-from src.catalog.catalog import DrugCatalog
+from src.catalog.catalog import DrugCatalog, combo_drug_id
 from src.cohorts.cohort import DrugCohort
 from src.config import PathConfig, ProtocolConfig
 
@@ -31,6 +30,7 @@ class CohortExtractor:
     self.con.execute("PRAGMA max_memory='48GB';")
     self.con.execute("PRAGMA preserve_insertion_order=false;")
 
+    # (ing_a, ing_b) -> lignes de co-initiation, annotées par la molécule source
     self.de_facto_pairs: dict[tuple[int, int], list[dict]] = {}
     self._init_duckdb_cache()
 
@@ -84,50 +84,59 @@ class CohortExtractor:
     print("-> Cache DuckDB prêt.")
 
   def get_atc4_comparators(self, target_id: int) -> list[int]:
-    """Résout la liste des molécules du catalogue partageant la même classe ATC4 (5 caractères)."""
-    if hasattr(self.catalog, "get_atc4_family_ids"):
-      res = self.catalog.get_atc4_family_ids(target_id)
-      if res:
-        return [int(x) for x in res if int(x) != target_id]
+    """Comparateurs du wash-out : classe(s) ATC4 de chaque ingrédient de la cible."""
+    return self.catalog.get_comparator_ids(target_id)
 
-    target_item = self.catalog.get(target_id)
-    if target_item is None:
-      return []
+  def _build_sql(self, target_id: int, kind: str) -> str:
+    """Requête TTE commune aux monothérapies et aux bi-thérapies fixes.
 
-    target_atc = (
-        getattr(target_item, "atc4", None)
-        or getattr(target_item, "atc", None)
-        or getattr(target_item, "atc3", None)
-    )
-    if not target_atc:
-      return []
-
-    target_prefix = str(target_atc)[:5].upper()
-    comparators = []
-    for item in self.catalog:
-      if item.drug_id == target_id:
-        continue
-      item_atc = (
-          getattr(item, "atc4", None)
-          or getattr(item, "atc", None)
-          or getattr(item, "atc3", None)
-      )
-      if item_atc and str(item_atc)[:5].upper() == target_prefix:
-        comparators.append(int(item.drug_id))
-
-    return comparators
-
-  def _build_sql(self, target_id: int) -> str:
+    Tables enregistrées au préalable :
+      - target_ingredients   : ingrédients de la cible (1 pour mono, 2 pour fixe)
+      - comparator_ingredients : comparateurs ATC4 (wash-out de classe)
+      - target_codes         : codes prescrits de la bi-thérapie fixe (kind fixe)
+    """
     p = self.protocol
+    is_fixed = kind == "fixed_combination"
+
+    if is_fixed:
+      # t0 = première dispensation du comprimé combiné
+      target_filter = (
+          "drug_concept_id IN (SELECT drug_concept_id FROM target_codes)"
+      )
+      # Seuls les 2 ingrédients du comprimé sont nouveaux à t0
+      final_filter = "c.n_new_drugs = 2 AND c.n_new_targets = 2"
+    else:
+      # t0 = première exposition à la molécule cible sous forme MONOTHÉRAPIE
+      target_filter = f"ingredient_id = {target_id} AND is_monotherapy = TRUE"
+      # 1 seule NOUVELLE molécule initiée à t0 (la cible) sous forme mono
+      # (les renouvellements d'ordonnances chroniques pré-existantes n'excluent pas le patient)
+      final_filter = "c.n_new_drugs = 1 AND c.all_monotherapies = TRUE"
+
+    # Bi-thérapies de facto : collectées uniquement depuis les passes monothérapie
+    de_facto_select = "" if is_fixed else f"""
+        -- RECORD 2 : Paires de facto
+        UNION ALL
+        SELECT 
+            2::TINYINT,
+            person_id,
+            t0,
+            t_6m,
+            t_12m,
+            history_days_prior,
+            follow_up_days,
+            has_12m_followup,
+            ingredient_id AS other_ingredient_id,
+            NULL::BIGINT
+        FROM co_initiations_de_facto
+        WHERE ingredient_id != {target_id}"""
 
     return f"""
         WITH 
-        -- 1. Date candidate t0 = Première exposition à la molécule cible sous forme MONOTHÉRAPIE
+        -- 1. Date candidate t0
         target_exposures AS (
-            SELECT person_id, exp_date
+            SELECT DISTINCT person_id, exp_date
             FROM drug_exposure
-            WHERE ingredient_id = {target_id}
-              AND is_monotherapy = TRUE
+            WHERE {target_filter}
         ),
         candidate_t0 AS (
             SELECT 
@@ -167,11 +176,12 @@ class CohortExtractor:
               AND de.exp_date < s.t0
         ),
 
-        -- Wash-out strict (365j) : exclusion si prise antérieure de la cible OU d'un comparateur ATC4
+        -- Wash-out strict (365j) : exclusion si prise antérieure d'un ingrédient cible
+        -- (sous toute forme) OU d'un comparateur ATC4
         prior_washout_violations AS (
             SELECT DISTINCT b.person_id
             FROM baseline_exposures b
-            WHERE b.ingredient_id = {target_id}
+            WHERE b.ingredient_id IN (SELECT ingredient_id FROM target_ingredients)
                OR b.ingredient_id IN (SELECT ingredient_id FROM comparator_ingredients)
         ),
         step_2_washout_valid AS (
@@ -198,7 +208,6 @@ class CohortExtractor:
              AND de.exp_date = s.t0
         ),
 
-        -- Distinction clinique fondamentale :
         -- Une molécule à t0 est NOUVELLE si elle n'a jamais été vue en baseline [t0 - 365j, t0[
         new_initiations_at_t0 AS (
             SELECT p.*
@@ -214,23 +223,23 @@ class CohortExtractor:
             SELECT 
                 person_id,
                 COUNT(DISTINCT ingredient_id)::INTEGER AS n_new_drugs,
+                COUNT(DISTINCT ingredient_id) FILTER (
+                    WHERE ingredient_id IN (SELECT ingredient_id FROM target_ingredients)
+                )::INTEGER AS n_new_targets,
                 BOOL_AND(is_monotherapy) AS all_monotherapies
             FROM new_initiations_at_t0
             GROUP BY person_id
         ),
 
-        -- Monothérapie retenue : 1 seule NOUVELLE molécule initiée à t0 (la cible) sous forme mono
-        -- (les renouvellements d'ordonnances chroniques pré-existantes n'excluent plus le patient)
-        step_3_pure_mono AS (
+        step_3_final AS (
             SELECT s.*
             FROM step_2_washout_valid s
             JOIN patient_new_counts c 
               ON s.person_id = c.person_id
-            WHERE c.n_new_drugs = 1 
-              AND c.all_monotherapies = TRUE
+            WHERE {final_filter}
         ),
 
-        -- Bi-thérapie de facto : exactement 2 NOUVELLES molécules initiées le même jour
+        -- Bi-thérapie de facto : exactement 2 NOUVELLES molécules mono initiées le même jour
         co_initiations_de_facto AS (
             SELECT n.*
             FROM new_initiations_at_t0 n
@@ -240,7 +249,7 @@ class CohortExtractor:
               AND c.all_monotherapies = TRUE
         )
 
-        -- RECORD 0 : Cohorte Monothérapie
+        -- RECORD 0 : Cohorte cible
         SELECT 
             0::TINYINT AS record_type,
             person_id,
@@ -252,7 +261,7 @@ class CohortExtractor:
             has_12m_followup,
             NULL::BIGINT AS other_ingredient_id,
             NULL::BIGINT AS n_patients
-        FROM step_3_pure_mono
+        FROM step_3_final
 
         -- RECORD 1 : Comptes d'attrition
         UNION ALL
@@ -262,23 +271,8 @@ class CohortExtractor:
         UNION ALL
         SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(*)::BIGINT FROM step_2_washout_valid
         UNION ALL
-        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(*)::BIGINT FROM step_3_pure_mono
-
-        -- RECORD 2 : Paires de facto
-        UNION ALL
-        SELECT 
-            2::TINYINT,
-            person_id,
-            t0,
-            t_6m,
-            t_12m,
-            history_days_prior,
-            follow_up_days,
-            has_12m_followup,
-            ingredient_id AS other_ingredient_id,
-            NULL::BIGINT
-        FROM co_initiations_de_facto
-        WHERE ingredient_id != {target_id};
+        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(*)::BIGINT FROM step_3_final
+        {de_facto_select};
         """
 
   def extract_cohort(
@@ -286,34 +280,48 @@ class CohortExtractor:
       target_id: int,
       comparator_ids: list[int] | None = None,
   ) -> DrugCohort | None:
+    """Extrait la cohorte d'une monothérapie ou d'une bi-thérapie fixe du catalogue."""
     item = self.catalog.get(target_id)
     if item is None:
       raise KeyError(f"Molécule {target_id} introuvable dans le DrugCatalog.")
+    if item.kind not in ("monotherapy", "fixed_combination"):
+      raise ValueError(
+          f"{item.name} ({item.kind}) : les de facto sont exportées via"
+          " export_valid_de_facto_cohorts()."
+      )
 
     # Résolution automatique des comparateurs ATC4 si non spécifiés
     if comparator_ids is None:
       comparator_ids = self.get_atc4_comparators(target_id)
 
+    ingredient_ids = list(item.ingredient_concept_ids) or [target_id]
+    self.con.register(
+        "target_ingredients",
+        pl.DataFrame({"ingredient_id": ingredient_ids}, schema={"ingredient_id": pl.Int64}),
+    )
     self.con.register(
         "comparator_ingredients",
+        pl.DataFrame({"ingredient_id": comparator_ids}, schema={"ingredient_id": pl.Int64}),
+    )
+    self.con.register(
+        "target_codes",
         pl.DataFrame(
-            {"ingredient_id": comparator_ids},
-            schema={"ingredient_id": pl.Int64},
+            {"drug_concept_id": sorted(item.descendant_concept_ids)},
+            schema={"drug_concept_id": pl.Int64},
         ),
     )
 
-    sql = self._build_sql(target_id)
+    sql = self._build_sql(target_id, item.kind)
     res_df = self.con.sql(sql).pl()
 
-    # Enregistrement des paires de facto
+    # Enregistrement des co-initiations de facto, annotées par la passe source
     co_init_df = res_df.filter(pl.col("record_type") == 2)
-    if len(co_init_df) > 0:
-      for row in co_init_df.iter_rows(named=True):
-        other_id = int(row["other_ingredient_id"])
-        pair_key = (min(target_id, other_id), max(target_id, other_id))
-        self.de_facto_pairs.setdefault(pair_key, []).append(row)
+    for row in co_init_df.iter_rows(named=True):
+      other_id = int(row["other_ingredient_id"])
+      pair_key = (min(target_id, other_id), max(target_id, other_id))
+      row["source_id"] = target_id
+      self.de_facto_pairs.setdefault(pair_key, []).append(row)
 
-    # Monothérapie
     stanford_index = (
         res_df.filter(pl.col("record_type") == 0)
         .select([
@@ -338,44 +346,60 @@ class CohortExtractor:
   def export_valid_de_facto_cohorts(
       self, min_size: int | None = None
   ) -> list[DrugCohort]:
+    """Construit les cohortes de facto à partir des co-initiations collectées.
+
+    Un patient n'est retenu que s'il a été capté par les passes des DEUX
+    ingrédients au même t0, c.-à-d. s'il satisfait le wash-out de la classe
+    ATC4 de A ET de celle de B. Les deux monothérapies doivent donc avoir été
+    extraites dans la même exécution.
+    """
     valid_cohorts = []
     threshold = (
         min_size if min_size is not None else self.protocol.min_de_facto_size
     )
 
     for (ing_a, ing_b), pts in self.de_facto_pairs.items():
-      unique_pts = {p["person_id"]: p for p in pts}
-      if len(unique_pts) >= threshold:
-        item_a = self.catalog.get(ing_a)
-        item_b = self.catalog.get(ing_b)
-        name_a = item_a.name if item_a else str(ing_a)
-        name_b = item_b.name if item_b else str(ing_b)
+      sources: dict[tuple[int, object], set[int]] = {}
+      rows: dict[tuple[int, object], dict] = {}
+      for r in pts:
+        key = (r["person_id"], r["t0"])
+        sources.setdefault(key, set()).add(r["source_id"])
+        rows.setdefault(key, r)
 
-        df_pts = (
-            pl.DataFrame(list(unique_pts.values()))
-            .select([
-                "person_id",
-                "t0",
-                "t_6m",
-                "t_12m",
-                "history_days_prior",
-                "follow_up_days",
-                "has_12m_followup",
-            ])
-            .sort(["person_id", "t0"])
-        )
+      valid_keys = [k for k, s in sources.items() if {ing_a, ing_b} <= s]
+      if len(valid_keys) < threshold:
+        continue
 
-        # ID 64-bit déterministe et sans collision
-        hash_digest = hashlib.md5(f"{ing_a}_{ing_b}".encode()).hexdigest()
-        combo_id = int(hash_digest[:12], 16) % (10**12) + 9_000_000_000_000
+      item_a = self.catalog.get(ing_a)
+      item_b = self.catalog.get(ing_b)
+      if item_a is None or item_b is None:
+        continue
 
-        combo_cohort = DrugCohort(
-            drug_id=combo_id,
-            name=f"{name_a} + {name_b} (De Facto)",
-            kind="de_facto_combination",
-            ingredient_concept_ids=[ing_a, ing_b],
-            stanford_index=df_pts,
-        )
-        valid_cohorts.append(combo_cohort)
+      df_pts = (
+          pl.DataFrame([rows[k] for k in valid_keys])
+          .select([
+              "person_id",
+              "t0",
+              "t_6m",
+              "t_12m",
+              "history_days_prior",
+              "follow_up_days",
+              "has_12m_followup",
+          ])
+          .sort(["person_id", "t0"])
+      )
+
+      combo_item = self.catalog.get_combination(
+          "de_facto_combination", ing_a, ing_b
+      ) or self.catalog.build_combination_item(
+          "de_facto_combination", item_a, item_b
+      )
+      assert combo_item.drug_id == combo_drug_id(
+          "de_facto_combination", ing_a, ing_b
+      )
+
+      valid_cohorts.append(
+          DrugCohort.from_drug_item(drug_item=combo_item, stanford_index=df_pts)
+      )
 
     return valid_cohorts

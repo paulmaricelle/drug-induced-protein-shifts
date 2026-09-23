@@ -2,11 +2,28 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Literal
 import numpy as np
 import polars as pl
+
+# Préfixes des IDs synthétiques (13 chiffres, sans collision avec les concept_id OMOP)
+# -> dossiers cohort_8* (bi-thérapies fixes) et cohort_9* (bi-thérapies de facto)
+_COMBO_ID_OFFSET = {
+    "fixed_combination": 8_000_000_000_000,
+    "de_facto_combination": 9_000_000_000_000,
+}
+
+
+def combo_drug_id(kind: str, ing_id_a: int, ing_id_b: int) -> int:
+    """ID 64-bit déterministe d'une bi-thérapie, invariant par permutation des ingrédients."""
+    a, b = sorted((int(ing_id_a), int(ing_id_b)))
+    # Clé historique "a_b" conservée pour les de facto (IDs déjà publiés)
+    key = f"{a}_{b}" if kind == "de_facto_combination" else f"{kind}_{a}_{b}"
+    digest = hashlib.md5(key.encode()).hexdigest()
+    return int(digest[:12], 16) % (10**12) + _COMBO_ID_OFFSET[kind]
 
 
 @dataclass
@@ -104,7 +121,8 @@ class DrugCatalog:
 
     def __init__(self, items: list[DrugItem] | None = None):
         self._items: dict[int, DrugItem] = {}
-        self._pair_to_combo_id: dict[tuple[int, int], int] = {}
+        # (kind, (ing_a, ing_b)) -> drug_id : une même paire peut exister en fixe ET de facto
+        self._pair_to_combo_id: dict[tuple[str, tuple[int, int]], int] = {}
         self._descendant_to_drug_id: dict[int, int] = {}
         self._atc4_to_drug_ids: dict[str, set[int]] = {}
 
@@ -124,7 +142,7 @@ class DrugCatalog:
         # Index des bi-thérapies par paire ordonnée d'ingrédients
         if item.is_combination and len(item.ingredient_concept_ids) == 2:
             pair = tuple(sorted(item.ingredient_concept_ids))
-            self._pair_to_combo_id[pair] = item.drug_id
+            self._pair_to_combo_id[(item.kind, pair)] = item.drug_id
 
         # Index inverse : descendant_concept_id (code prescrit) -> drug_id
         for desc_id in item.descendant_concept_ids:
@@ -153,126 +171,141 @@ class DrugCatalog:
         family_members = self._atc4_to_drug_ids.get(code, set())
         return sorted([did for did in family_members if did != drug_id])
 
+    def get_comparator_ids(self, drug_id: int) -> list[int]:
+        """Comparateurs du wash-out : union des familles ATC4 de chaque ingrédient.
+
+        Pour une monothérapie, équivaut à get_atc4_family_ids. Pour une
+        bi-thérapie, couvre les classes des deux ingrédients (hors ingrédients eux-mêmes).
+        """
+        item = self.get(drug_id)
+        if item is None:
+            return []
+        ingredients = set(item.ingredient_concept_ids) or {drug_id}
+        comparators: set[int] = set()
+        for ing_id in ingredients:
+            comparators.update(self.get_atc4_family_ids(ing_id))
+        return sorted(comparators - ingredients)
+
+    def get_combination(
+        self, kind: str, ing_id_a: int, ing_id_b: int
+    ) -> DrugItem | None:
+        pair = tuple(sorted((int(ing_id_a), int(ing_id_b))))
+        combo_id = self._pair_to_combo_id.get((kind, pair))
+        return self._items.get(combo_id) if combo_id is not None else None
+
+    @staticmethod
+    def build_combination_item(
+        kind: str,
+        item_a: DrugItem,
+        item_b: DrugItem,
+        name: str | None = None,
+        descendant_concept_ids: set[int] | None = None,
+    ) -> DrugItem:
+        """Construit une bi-thérapie (fixe ou de facto) à partir de ses deux ingrédients."""
+        a, b = sorted([item_a, item_b], key=lambda it: it.drug_id)
+        if name is None:
+            suffix = "(Fixed Dose)" if kind == "fixed_combination" else "(De Facto)"
+            sep = " / " if kind == "fixed_combination" else " + "
+            name = f"{a.name}{sep}{b.name} {suffix}"
+
+        # u_{A+B} = u_A + u_B (Section 3.3)
+        u_combo = None
+        if a.target_vector is not None and b.target_vector is not None:
+            u_combo = a.target_vector + b.target_vector
+
+        # Embedding textuel combiné normalisé
+        text_combo = None
+        if a.text_embedding is not None and b.text_embedding is not None:
+            text_combo = (a.text_embedding + b.text_embedding) / 2.0
+            norm = np.linalg.norm(text_combo)
+            if norm > 0:
+                text_combo = text_combo / norm
+
+        return DrugItem(
+            drug_id=combo_drug_id(kind, a.drug_id, b.drug_id),
+            name=name,
+            kind=kind,
+            ingredient_concept_ids=[a.drug_id, b.drug_id],
+            ingredient_names=[a.name, b.name],
+            atc4=None,
+            descendant_concept_ids=descendant_concept_ids or set(),
+            targets=a.targets + b.targets,
+            target_vector=u_combo,
+            text_embedding=text_combo,
+        )
+
     def get_or_create_de_facto_combination(
         self, ing_id_a: int, ing_id_b: int
     ) -> DrugItem:
         """Récupère ou instancie à la volée une bi-thérapie prescrite conjointement (Section 3.3)."""
-        pair = tuple(sorted([ing_id_a, ing_id_b]))
-        if pair in self._pair_to_combo_id:
-            return self._items[self._pair_to_combo_id[pair]]
+        existing = self.get_combination("de_facto_combination", ing_id_a, ing_id_b)
+        if existing is not None:
+            return existing
 
         item_a = self.get(ing_id_a)
         item_b = self.get(ing_id_b)
         if not item_a or not item_b:
             raise ValueError(f"Ingrédients introuvables : {ing_id_a}, {ing_id_b}")
 
-        import hashlib
-
-        hash_digest = hashlib.md5(f"{pair[0]}_{pair[1]}".encode()).hexdigest()
-        synth_id = int(hash_digest[:12], 16) % (10**12) + 9_000_000_000_000
-        name = f"{item_a.name} + {item_b.name}"
-
-        # u_{A+B} = u_A + u_B (Section 3.3)
-        u_combo = None
-        if item_a.target_vector is not None and item_b.target_vector is not None:
-            u_combo = item_a.target_vector + item_b.target_vector
-
-        # Embedding textuel combiné
-        text_combo = None
-        if item_a.text_embedding is not None and item_b.text_embedding is not None:
-            text_combo = (item_a.text_embedding + item_b.text_embedding) / 2.0
-            norm = np.linalg.norm(text_combo)
-            if norm > 0:
-                text_combo = text_combo / norm
-
-        combo_item = DrugItem(
-            drug_id=synth_id,
-            name=name,
-            kind="de_facto_combination",
-            ingredient_concept_ids=list(pair),
-            ingredient_names=[item_a.name, item_b.name],
-            descendant_concept_ids=set(),
-            targets=item_a.targets + item_b.targets,
-            target_vector=u_combo,
-            text_embedding=text_combo,
+        combo_item = self.build_combination_item(
+            "de_facto_combination", item_a, item_b
         )
         self.add_item(combo_item)
         return combo_item
+
+    def without_kind(self, kind: str) -> DrugCatalog:
+        """Copie du catalogue sans les items d'un type donné (ex. purge des de facto)."""
+        return DrugCatalog([item for item in self if item.kind != kind])
 
     def register_de_facto_cohorts(self, cohorts_dir: str | Path) -> int:
         """Détecte et enregistre dans le catalogue les bi-thérapies de facto
 
         sauvegardées sur le disque (cohort_9*), en reconstituant leur vecteur u_a.
+        Les paires dont un ingrédient est absent du catalogue sont ignorées.
         """
         cohorts_path = Path(cohorts_dir)
         n_loaded = 0
-        for meta_file in cohorts_path.glob("cohort_9*/metadata.json"):
+        n_skipped = 0
+        for meta_file in sorted(cohorts_path.glob("cohort_9*/metadata.json")):
             try:
                 with open(meta_file, encoding="utf-8") as f:
                     meta = json.load(f)
-
                 combo_id = int(meta["drug_id"])
-                if combo_id in self._items:
-                    continue
-
-                ing_ids = meta.get("ingredient_concept_ids", [])
-                if len(ing_ids) != 2:
-                    continue
-
-                item_a = self.get(ing_ids[0])
-                item_b = self.get(ing_ids[1])
-
-                u_combo = None
-                if (
-                    item_a
-                    and item_b
-                    and item_a.target_vector is not None
-                    and item_b.target_vector is not None
-                ):
-                    u_combo = item_a.target_vector + item_b.target_vector
-
-                text_combo = None
-                if (
-                    item_a
-                    and item_b
-                    and item_a.text_embedding is not None
-                    and item_b.text_embedding is not None
-                ):
-                    text_combo = (
-                        item_a.text_embedding + item_b.text_embedding
-                    ) / 2.0
-                    norm = np.linalg.norm(text_combo)
-                    if norm > 0:
-                        text_combo = text_combo / norm
-
-                combo_item = DrugItem(
-                    drug_id=combo_id,
-                    name=meta.get(
-                        "name",
-                        f"{item_a.name if item_a else ing_ids[0]} + {item_b.name if item_b else ing_ids[1]} (De Facto)",
-                    ),
-                    kind="de_facto_combination",
-                    ingredient_concept_ids=ing_ids,
-                    ingredient_names=[
-                        item_a.name if item_a else str(ing_ids[0]),
-                        item_b.name if item_b else str(ing_ids[1]),
-                    ],
-                    atc4=None,
-                    descendant_concept_ids=set(),
-                    targets=(item_a.targets if item_a else [])
-                    + (item_b.targets if item_b else []),
-                    target_vector=u_combo,
-                    text_embedding=text_combo,
-                )
-                self.add_item(combo_item)
-                n_loaded += 1
-            except Exception:
+                ing_ids = [int(x) for x in meta.get("ingredient_concept_ids", [])]
+            except (OSError, json.JSONDecodeError, KeyError, ValueError) as e:
+                print(f"[Avertissement] Métadonnées illisibles ({meta_file}) : {e}")
+                n_skipped += 1
                 continue
 
-        if n_loaded > 0:
+            if combo_id in self._items:
+                continue
+            if meta.get("kind") != "de_facto_combination" or len(ing_ids) != 2:
+                continue
+
+            item_a = self.get(ing_ids[0])
+            item_b = self.get(ing_ids[1])
+            if not item_a or not item_b:
+                n_skipped += 1
+                continue
+
+            combo_item = self.build_combination_item(
+                "de_facto_combination", item_a, item_b, name=meta.get("name")
+            )
+            if combo_item.drug_id != combo_id:
+                print(
+                    f"[Avertissement] ID incohérent pour {meta_file.parent.name}"
+                    f" (attendu {combo_item.drug_id})."
+                )
+                n_skipped += 1
+                continue
+
+            self.add_item(combo_item)
+            n_loaded += 1
+
+        if n_loaded or n_skipped:
             print(
                 f"-> {n_loaded:,} bi-thérapies de facto rattachées au"
-                " DrugCatalog."
+                f" DrugCatalog ({n_skipped} ignorées)."
             )
         return n_loaded
 
@@ -393,39 +426,11 @@ class DrugCatalog:
             if not item_a or not item_b:
                 continue
 
-            synth_id = -int(abs(hash(pair)) % (10**9))
-            combo_name = f"{item_a.name} / {item_b.name} (Fixed Dose)"
-
-            u_combo = (
-                (item_a.target_vector + item_b.target_vector)
-                if (
-                    item_a.target_vector is not None
-                    and item_b.target_vector is not None
-                )
-                else None
-            )
-
-            text_combo = None
-            if (
-                item_a.text_embedding is not None
-                and item_b.text_embedding is not None
-            ):
-                text_combo = (item_a.text_embedding + item_b.text_embedding) / 2.0
-                norm = np.linalg.norm(text_combo)
-                if norm > 0:
-                    text_combo = text_combo / norm
-
-            fixed_item = DrugItem(
-                drug_id=synth_id,
-                name=combo_name,
-                kind="fixed_combination",
-                ingredient_concept_ids=list(pair),
-                ingredient_names=[item_a.name, item_b.name],
-                atc4=None,
+            fixed_item = cls.build_combination_item(
+                "fixed_combination",
+                item_a,
+                item_b,
                 descendant_concept_ids=set(desc_ids),
-                targets=item_a.targets + item_b.targets,
-                target_vector=u_combo,
-                text_embedding=text_combo,
             )
             catalog.add_item(fixed_item)
 
