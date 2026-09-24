@@ -97,7 +97,6 @@ def main():
 
     if args.intra_atc4:
         generate_intra_atc4_pairs(catalog, paths, args.min_n, registry)
-        registry.save_parquet(pairs_file)
 
     if args.method1_indications:
         extract_shared_indication_pairs(
@@ -106,7 +105,10 @@ def main():
             min_cohort_size=args.min_n,
             registry=registry,
         )
-        registry.save_parquet(pairs_file)
+
+    # Toujours recalculé : les registres antérieurs n'ont pas ces colonnes
+    registry.annotate_ingredient_overlap(catalog)
+    registry.save_parquet(pairs_file)
 
     if args.audit or not (args.method1_indications or args.intra_atc4):
         print("\n" + "=" * 80)
@@ -131,6 +133,16 @@ def main():
             print(
                 f" - Paires consensus (Méthode 1 & ATC4)       :"
                 f" {p_both:,}"
+            )
+            p_addon = df.filter(pl.col("is_add_on")).height
+            p_same = df.filter(pl.col("same_ingredients")).height
+            print(
+                f" - Paires add-on (A+B vs A)                  :"
+                f" {p_addon:,}"
+            )
+            print(
+                f" - Paires mêmes ingrédients (fixe/de facto)  :"
+                f" {p_same:,}"
             )
             print("\nExemples de paires candidates :")
             cols = [

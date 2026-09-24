@@ -72,7 +72,7 @@ def extract_shared_indication_pairs(
     cond_glob = str(paths.omop_dir / "condition_occurrence" / "*.csv.zst")
     vocab_parquet = "/remote/shared/collab/omop-vocabularies/v20250227/CONCEPT.parquet"
 
-    print("Recherche des diagnostics à ou avant t0 (dans les 365 derniers jours)...")
+    print("Recherche des diagnostics à ou avant t0 (fenêtre [t0 - 30j, t0])...")
     t0_start = time.time()
 
     query = f"""

@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working rules (from the project owner — follow strictly)
+
+- **Role: coding agent.** Goal is to move the project forward fast: edit code, run pipelines, debug. Act freely on technical work and on minor conceptual calls needed to fix a bug.
+- **Research direction is the owner's call.** Project direction, the next major step, and architectural choices must be decided by the owner. When a technical step is done, report back and decide the next direction together. Proposing concepts (drawing on codebase knowledge) is welcome, but consult as soon as a conceptual question arises — don't let that slow down technical action.
+- **No direct access to EHR data.** Never read, open, `head`, sample or print the contents of EHR folders (raw STARR OMOP, `data/cache_*`, cohort parquet files, labs, etc.) or any personal medical data. Writing code that reads them inside extraction pipelines is fine. Only aggregate statistics (cohort sizes under given conditions, attrition counts, pair counts) may be printed and inspected.
+
 ## Project overview
 
 Research pipeline for **Target Trial Emulation (TTE)** of drug comparisons on Stanford STARR OMOP EHR data (UK Biobank Olink support is scaffolded in `DrugCohort` but not yet populated). It builds a drug catalog with biological target vectors, extracts new-user drug cohorts, attaches lab biomarkers, and generates candidate active-comparator pairs. Code comments, docstrings, CLI help and console output are in **French**, and docstrings cite protocol sections (e.g. "Section 4.2"). Keep that convention.
@@ -37,7 +43,7 @@ python scripts/sync_defacto_to_catalog.py  # replaces the catalog's de facto com
 python scripts/cache_biomarkers.py         # scans STARR measurement shards -> cache_full/biomarkers_measurements.parquet
 python scripts/extract_biomarkers.py [--min-n 1]
 
-# 5. Candidate comparator pairs -> data/candidate_pairs.parquet
+# 5. Candidate comparator pairs -> data/candidate_pairs.parquet (flags is_add_on / same_ingredients recomputed on every run)
 python scripts/build_candidate_pairs.py --intra-atc4 --method1-indications [--min-n 100]
 python scripts/build_candidate_pairs.py    # no flags = audit the registry
 ```
@@ -60,7 +66,7 @@ To exercise a single drug, run `scripts/extract_cohorts.py --limit N`, run `audi
   - Collect de facto co-initiations: exactly two new ingredients on the same day.
 
   Rows are tagged by `record_type` (0 = cohort, 1 = attrition counts, 2 = de facto rows). De facto pairs build up in memory across the batch and are exported at the end.
-- **`DrugCohort`** (`src/cohorts/cohort.py`) is saved to `<output_cohorts_dir>/cohort_<drug_id>/`. The folder holds `metadata.json` and `stanford_index.parquet` (person_id, t0, t_6m, t_12m, follow-up flags), plus `stanford_labs.parquet`, `biomarkers.parquet` and optional `.npy` tensors (MOTOR z0 768-d, RABIT deltas, UKB Olink, k-means prototypes). `data/cohorts/manifest.parquet` records one row per drug (`status` SAVED/ZERO_PATIENT, `n_final_stanford`). Downstream steps filter on `status == "SAVED" & n_final_stanford >= min_n`.
+- **`DrugCohort`** (`src/cohorts/cohort.py`) is saved to `<output_cohorts_dir>/cohort_<drug_id>/`. The folder holds `metadata.json` and `stanford_index.parquet` (person_id, t0, t_6m, t_12m, follow-up flags), plus `stanford_labs.parquet` (biomarkers written by `extract_biomarkers.py`; older cohorts used `biomarkers.parquet`) and optional `.npy` tensors (MOTOR z0 768-d, RABIT deltas, UKB Olink, k-means prototypes). `data/cohorts/manifest.parquet` records one row per drug (`status` SAVED/ZERO_PATIENT, `n_final_stanford`). Downstream steps filter on `status == "SAVED" & n_final_stanford >= min_n`.
 - **Combination IDs** are synthetic 13-digit IDs computed only by `combo_drug_id()` in `src/catalog/catalog.py`. Fixed combinations get `8…` (folders `cohort_8*`) and de facto combinations get `9…` (folders `cohort_9*`, which `register_de_facto_cohorts` scans). The same ingredient pair can exist as both kinds, so the pair index is keyed by `(kind, pair)` (`DrugCatalog.get_combination`). Build combination items only with `DrugCatalog.build_combination_item`, which sets `u = u_A + u_B` and uses the normalized mean of the two text embeddings.
 - **What each cohort contains:**
   - A *monotherapy* cohort has exactly one new ingredient at t0, taken as monotherapy.

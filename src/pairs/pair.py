@@ -24,6 +24,12 @@ class CandidatePair:
     by_kmeans: bool = False
     by_atc4: bool = False
 
+    # Recouvrement d'ingrédients (usage à décider pour l'entraînement)
+    # is_add_on : ingrédients de l'un strictement inclus dans l'autre (A+B vs A)
+    # same_ingredients : mêmes ingrédients sous deux formes (fixe vs de facto)
+    is_add_on: bool = False
+    same_ingredients: bool = False
+
     # Métriques quantitatives associées
     prevalence_a: float | None = None
     prevalence_b: float | None = None
@@ -77,6 +83,8 @@ class PairRegistry:
         "by_css": pl.Boolean,
         "by_kmeans": pl.Boolean,
         "by_atc4": pl.Boolean,
+        "is_add_on": pl.Boolean,
+        "same_ingredients": pl.Boolean,
         "prevalence_a": pl.Float64,
         "prevalence_b": pl.Float64,
         "css_score": pl.Float64,
@@ -109,6 +117,17 @@ class PairRegistry:
                 existing.stratum_name = pair.stratum_name
         else:
             self._pairs[key] = pair
+
+    def annotate_ingredient_overlap(self, catalog) -> None:
+        """Marque les paires dont les ensembles d'ingrédients se recouvrent."""
+        for p in self._pairs.values():
+            item_a, item_b = catalog.get(p.drug_id_a), catalog.get(p.drug_id_b)
+            if item_a is None or item_b is None:
+                continue
+            ings_a = set(item_a.ingredient_concept_ids) or {item_a.drug_id}
+            ings_b = set(item_b.ingredient_concept_ids) or {item_b.drug_id}
+            p.same_ingredients = ings_a == ings_b
+            p.is_add_on = ings_a < ings_b or ings_b < ings_a
 
     def to_dataframe(self) -> pl.DataFrame:
         records = [asdict(p) for p in self._pairs.values()]
