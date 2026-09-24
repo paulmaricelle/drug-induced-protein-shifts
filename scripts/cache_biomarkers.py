@@ -70,6 +70,25 @@ def build_biomarkers_cache():
   # Remplacement atomique : l'ancien cache reste valide en cas d'échec
   tmp_parquet.replace(output_parquet)
 
+  # Démographie nécessaire au recalcul de l'eGFR (CKD-EPI 2021 : âge et sexe)
+  person_pattern = str(paths.omop_dir / "person" / "*.csv.zst")
+  demo_parquet = paths.cache_dir / "person_demographics.parquet"
+  con.execute(f"""
+    COPY (
+        SELECT
+            TRY_CAST(person_id AS BIGINT) AS person_id,
+            TRY_CAST(gender_concept_id AS BIGINT) AS gender_concept_id,
+            COALESCE(
+                TRY_CAST(birth_datetime AS DATE),
+                TRY_CAST(make_date(TRY_CAST(year_of_birth AS INTEGER),
+                                   COALESCE(TRY_CAST(month_of_birth AS INTEGER), 7),
+                                   COALESCE(TRY_CAST(day_of_birth AS INTEGER), 1)) AS DATE)
+            ) AS birth_date
+        FROM read_csv('{person_pattern}', header = true, union_by_name = true)
+    ) TO '{demo_parquet}' (FORMAT PARQUET);
+  """)
+  print(f"  * Démographie   : {demo_parquet}")
+
   elapsed = time.time() - start_time
   size_mb = output_parquet.stat().st_size / (1024 * 1024)
 

@@ -14,7 +14,10 @@ from dataclasses import dataclass, field
 MG_DL = 8840
 MG_DL_CALC = 9028
 MG_L = 8751
-ML_MIN_M2 = 710208  # série eGFR tronquée (">60" enregistré comme 60)
+
+# Genre OMOP
+FEMALE = 8532
+MALE = 8507
 
 
 @dataclass(frozen=True)
@@ -34,8 +37,11 @@ class LabConcept:
 class Biomarker:
   name: str
   unit: str
-  valid_range: tuple[float, float]  # dans l'unité harmonisée
+  valid_range: tuple[float, float]  # dans l'unité harmonisée (des concepts mesurés)
   concepts: tuple[LabConcept, ...]
+  # Biomarqueur dérivé : formule appliquée aux valeurs mesurées (cf. extract_biomarkers.py)
+  derived: str | None = None
+  derived_range: tuple[float, float] | None = None
 
 
 BIOMARKERS: tuple[Biomarker, ...] = (
@@ -53,15 +59,13 @@ BIOMARKERS: tuple[Biomarker, ...] = (
         # IFCC en mmol/mol -> NGSP % (équation maîtresse NGSP-IFCC)
         LabConcept(40762352, priority=2, factor=0.09148, offset=2.152),
     )),
-    Biomarker("egfr", "mL/min/1.73m2", (3.0, 180.0), (
-        # Formules sans coefficient racial uniquement ; priorité à CKD-EPI 2021
-        LabConcept(1619025, priority=1),  # CKD-EPI 2021
-        LabConcept(40764999, priority=2),  # CKD-EPI 2009
-        LabConcept(46236952, priority=3, excluded_units=(ML_MIN_M2,)),  # MDRD
-        LabConcept(3049187, priority=3),  # MDRD non-blacks
-        LabConcept(3030354, priority=3),  # MDRD
-        LabConcept(40771922, priority=4),  # formule non précisée
-    )),
+    # eGFR recalculé en CKD-EPI 2021 (sans coefficient racial) à partir de la créatinine
+    # sérique, l'âge et le sexe : même formule à toutes les dates. Les eGFR rapportés par
+    # le laboratoire mélangent MDRD, CKD-EPI 2009 et 2021 (bascule vers 2021-2022).
+    # valid_range porte sur la créatinine (mg/dL), derived_range sur l'eGFR.
+    Biomarker("egfr", "mL/min/1.73m2", (0.1, 25.0), (
+        LabConcept(3016723),  # Creatinine [Mass/volume] in Serum or Plasma (mg/dL)
+    ), derived="ckd_epi_2021", derived_range=(3.0, 180.0)),
     Biomarker("alt", "U/L", (2.0, 2000.0), (
         LabConcept(3006923),  # U/L et UI/L équivalents
         LabConcept(3005755),  # avec phosphate de pyridoxal

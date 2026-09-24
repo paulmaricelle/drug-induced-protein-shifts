@@ -19,17 +19,25 @@ if str(ROOT_DIR) not in sys.path:
 import duckdb
 import polars as pl
 from tqdm import tqdm
-from src.cohorts.biomarkers import concept_table_records
+from src.cohorts.biomarkers import BIOMARKERS, FEMALE, MALE, concept_table_records
 from src.config import PathConfig
+
+# Fenêtre de baseline [t0 - N j, t0] : mesure la plus proche de t0. La baseline n'est pas
+# requise (issue = valeur à 6/12 mois) ; elle sert de covariable pronostique si présente.
+BASELINE_DAYS = 180
 
 
 def run_batch_biomarker_extraction(min_n: int = 1) -> None:
     paths = PathConfig(is_sample=False)
     manifest_path = paths.output_cohorts_dir / "manifest.parquet"
     cache_bio = paths.cache_dir / "biomarkers_measurements.parquet"
+    demo_parquet = paths.cache_dir / "person_demographics.parquet"
+    EGFR_LO, EGFR_HI = next(b.derived_range for b in BIOMARKERS if b.name == "egfr")
 
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifeste introuvable : {manifest_path}")
+    if not demo_parquet.exists():
+        raise FileNotFoundError(f"Démographie introuvable : {demo_parquet} (lancer cache_biomarkers.py)")
     if not cache_bio.exists():
         raise FileNotFoundError(f"Cache local des biomarqueurs introuvable : {cache_bio}")
 
@@ -121,6 +129,33 @@ def run_batch_biomarker_extraction(min_n: int = 1) -> None:
         WHERE priority = best_priority
         GROUP BY 1, 2, 3
     ),
+    -- eGFR CKD-EPI 2021 recalculé depuis la créatinine (adultes, sexe renseigné)
+    derived_measurements AS (
+        SELECT f.person_id, f.measurement_date, f.biomarker,
+            CASE WHEN f.biomarker = 'egfr' THEN
+                142.0
+                * POW(LEAST(f.val / k, 1.0), a)
+                * POW(GREATEST(f.val / k, 1.0), -1.200)
+                * POW(0.9938, age)
+                * CASE WHEN female THEN 1.012 ELSE 1.0 END
+            ELSE f.val END AS val
+        FROM (
+            SELECT f.*,
+                (d.gender_concept_id = {FEMALE}) AS female,
+                CASE WHEN d.gender_concept_id = {FEMALE} THEN 0.7 ELSE 0.9 END AS k,
+                CASE WHEN d.gender_concept_id = {FEMALE} THEN -0.241 ELSE -0.302 END AS a,
+                DATE_DIFF('day', d.birth_date, f.measurement_date) / 365.25 AS age,
+                d.gender_concept_id
+            FROM filtered_measurements f
+            LEFT JOIN read_parquet('{demo_parquet}') d ON d.person_id = f.person_id
+        ) f
+        WHERE f.biomarker <> 'egfr'
+           OR (f.gender_concept_id IN ({FEMALE}, {MALE}) AND f.age >= 18)
+    ),
+    final_measurements AS (
+        SELECT * FROM derived_measurements
+        WHERE biomarker <> 'egfr' OR val BETWEEN {EGFR_LO} AND {EGFR_HI}
+    ),
     candidate_windows AS (
         SELECT 
             c.drug_id,
@@ -128,19 +163,19 @@ def run_batch_biomarker_extraction(min_n: int = 1) -> None:
             m.biomarker,
             m.val,
             CASE 
-                WHEN m.measurement_date >= (c.t0 - INTERVAL '90 days') AND m.measurement_date <= c.t0 THEN 'baseline'
+                WHEN m.measurement_date >= (c.t0 - INTERVAL '{BASELINE_DAYS} days') AND m.measurement_date <= c.t0 THEN 'baseline'
                 WHEN m.measurement_date >= (c.t0 + INTERVAL '120 days') AND m.measurement_date <= (c.t0 + INTERVAL '240 days') THEN 'm6'
                 WHEN m.measurement_date >= (c.t0 + INTERVAL '300 days') AND m.measurement_date <= (c.t0 + INTERVAL '420 days') THEN 'm12'
             END AS window_name,
             CASE 
-                WHEN m.measurement_date >= (c.t0 - INTERVAL '90 days') AND m.measurement_date <= c.t0 THEN ABS(c.t0 - m.measurement_date)
+                WHEN m.measurement_date >= (c.t0 - INTERVAL '{BASELINE_DAYS} days') AND m.measurement_date <= c.t0 THEN ABS(c.t0 - m.measurement_date)
                 WHEN m.measurement_date >= (c.t0 + INTERVAL '120 days') AND m.measurement_date <= (c.t0 + INTERVAL '240 days') THEN ABS(c.t_6m - m.measurement_date)
                 WHEN m.measurement_date >= (c.t0 + INTERVAL '300 days') AND m.measurement_date <= (c.t0 + INTERVAL '420 days') THEN ABS(c.t_12m - m.measurement_date)
             END AS dist_to_target,
             m.measurement_date
         FROM all_targets c
-        JOIN filtered_measurements m ON c.person_id = m.person_id
-        WHERE m.measurement_date >= (c.t0 - INTERVAL '90 days')
+        JOIN final_measurements m ON c.person_id = m.person_id
+        WHERE m.measurement_date >= (c.t0 - INTERVAL '{BASELINE_DAYS} days')
           AND m.measurement_date <= (c.t0 + INTERVAL '420 days')
     ),
     best_per_window AS (
