@@ -19,6 +19,7 @@ if str(ROOT_DIR) not in sys.path:
 import duckdb
 import polars as pl
 from tqdm import tqdm
+from src.cohorts.biomarkers import concept_table_records
 from src.config import PathConfig
 
 
@@ -76,33 +77,49 @@ def run_batch_biomarker_extraction(min_n: int = 1) -> None:
     con.execute("PRAGMA memory_limit='40GB';")
 
     con.register("all_targets", all_targets_df)
+    # Règles d'harmonisation (concept x unité), cf. src/cohorts/biomarkers.py
+    con.register("lab_rules", pl.DataFrame(concept_table_records(), schema={
+        "concept_id": pl.Int64, "biomarker": pl.Utf8, "priority": pl.Int64,
+        "lo": pl.Float64, "hi": pl.Float64, "offset": pl.Float64,
+        "unit_concept_id": pl.Int64, "factor": pl.Float64, "excluded": pl.Boolean,
+    }))
 
-    print("\n[3/5] Exécution de la passe unique de jointure sur 416M de mesures...")
+    print("\n[3/5] Exécution de la passe unique de jointure sur les mesures...")
     t_join = time.time()
 
     query = f"""
-    WITH filtered_measurements AS (
-        SELECT 
-            person_id,
-            measurement_date,
-            CASE 
-                WHEN measurement_concept_id IN (3028288, 3027597) THEN 'ldl'
-                WHEN measurement_concept_id IN (3004410, 3005673, 40762352) THEN 'hba1c'
-                WHEN measurement_concept_id IN (3049187, 3053283, 3030354, 40764999) THEN 'egfr'
-                WHEN measurement_concept_id IN (3006923, 3000676) THEN 'alt'
-                WHEN measurement_concept_id IN (3020460, 3010156, 3007461) THEN 'crp'
-                WHEN measurement_concept_id IN (3004249) THEN 'sbp'
-            END AS biomarker,
-            value_as_number AS val
-        FROM read_parquet('{cache_bio}')
-        WHERE (
-            (measurement_concept_id IN (3028288, 3027597) AND value_as_number BETWEEN 10.0 AND 400.0)
-            OR (measurement_concept_id IN (3004410, 3005673, 40762352) AND value_as_number BETWEEN 3.0 AND 20.0)
-            OR (measurement_concept_id IN (3049187, 3053283, 3030354, 40764999) AND value_as_number BETWEEN 3.0 AND 180.0)
-            OR (measurement_concept_id IN (3006923, 3000676) AND value_as_number BETWEEN 2.0 AND 2000.0)
-            OR (measurement_concept_id IN (3020460, 3010156, 3007461) AND value_as_number BETWEEN 0.05 AND 300.0)
-            OR (measurement_concept_id IN (3004249) AND value_as_number BETWEEN 60.0 AND 260.0)
+    WITH harmonized AS (
+        -- Règle spécifique à l'unité si elle existe, sinon règle par défaut du concept
+        SELECT
+            m.person_id,
+            m.measurement_date,
+            COALESCE(ru.biomarker, rd.biomarker) AS biomarker,
+            COALESCE(ru.priority, rd.priority) AS priority,
+            COALESCE(ru.factor, rd.factor) * m.value_as_number
+              + COALESCE(ru.offset, rd.offset) AS val,
+            COALESCE(ru.excluded, rd.excluded) AS excluded,
+            COALESCE(ru.lo, rd.lo) AS lo,
+            COALESCE(ru.hi, rd.hi) AS hi
+        FROM read_parquet('{cache_bio}') m
+        LEFT JOIN lab_rules ru
+          ON ru.concept_id = m.measurement_concept_id
+         AND ru.unit_concept_id = m.unit_concept_id
+        LEFT JOIN lab_rules rd
+          ON rd.concept_id = m.measurement_concept_id
+         AND rd.unit_concept_id IS NULL
+        WHERE COALESCE(ru.concept_id, rd.concept_id) IS NOT NULL
+    ),
+    -- Une valeur par (patient, biomarqueur, jour) : concept prioritaire, moyenne des répétitions
+    filtered_measurements AS (
+        SELECT person_id, measurement_date, biomarker, AVG(val) AS val
+        FROM (
+            SELECT *, MIN(priority) OVER (
+                PARTITION BY person_id, biomarker, measurement_date) AS best_priority
+            FROM harmonized
+            WHERE NOT excluded AND val BETWEEN lo AND hi
         )
+        WHERE priority = best_priority
+        GROUP BY 1, 2, 3
     ),
     candidate_windows AS (
         SELECT 
@@ -175,8 +192,12 @@ def run_batch_biomarker_extraction(min_n: int = 1) -> None:
     print(f"      -> {df_results.height:,} lignes de biomarqueurs extraites.")
 
     # 5. Écriture par lot dans chaque répertoire de cohorte
-    print("\n[5/5] Écriture des fichiers biomarkers.parquet par cohorte...")
+    print("\n[5/5] Écriture des fichiers stanford_labs.parquet par cohorte...")
     cohorts_written = 0
+    # Purge préalable : une cohorte sans aucune mesure ne doit pas garder un fichier périmé
+    for cid in eligible_ids:
+        for name in ("stanford_labs.parquet", "biomarkers.parquet"):
+            (paths.output_cohorts_dir / f"cohort_{cid}" / name).unlink(missing_ok=True)
 
     for sub_df in tqdm(df_results.partition_by("drug_id"), desc="Écriture disque"):
         cid = sub_df["drug_id"][0]
@@ -203,7 +224,7 @@ def run_batch_biomarker_extraction(min_n: int = 1) -> None:
 
     print("=" * 90)
     print(f"TRAITEMENT COMPLET EN {(time.time() - t_start)/60:.2f} MINUTES !")
-    print(f"  * Cohortes enrichies avec biomarkers.parquet : {cohorts_written:,}")
+    print(f"  * Cohortes enrichies (stanford_labs.parquet) : {cohorts_written:,}")
     print(f"  * Synthèse globale exportée dans            : {summary_path}")
     print("=" * 90)
 

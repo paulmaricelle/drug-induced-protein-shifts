@@ -39,7 +39,7 @@ python scripts/extract_cohorts.py --full [--limit N] [--no-resume]
 python scripts/audit_cohorts.py [--drugs ID ...]
 python scripts/sync_defacto_to_catalog.py  # replaces the catalog's `combination` items with those on disk (cohort_9*)
 
-# 4. Biomarkers (LDL, HbA1c, eGFR, ALT, CRP, SBP)
+# 4. Biomarkers (LDL, HbA1c, eGFR, ALT, CRP, SBP). Concepts, units, conversions and ranges: src/cohorts/biomarkers.py (single source)
 python scripts/cache_biomarkers.py         # scans STARR measurement shards -> cache_full/biomarkers_measurements.parquet
 python scripts/extract_biomarkers.py [--min-n 1]
 
@@ -59,11 +59,17 @@ To exercise a single drug, run `scripts/extract_cohorts.py --limit N`, run `audi
   - `u_a` combines ChEMBL targets (`chembl.py`, `drug_features.py`: potency and agonist/antagonist direction) with per-protein features `v_p` (`protein_features.py`). `v_p` is the L2-normalized concatenation of ESM-2 650M, Reactome SVD (128), STRING (128) and GTEx (54).
   - `DrugCatalog` keeps inverse indexes: prescribed concept → drug in O(1), ATC4 → family, and ingredient pair → combination.
 - **`src/cohorts/`**: `CohortExtractor` loads the parquet cache into in-memory DuckDB (16 threads, 48 GB). It runs one large SQL query per drug with these steps:
-  - Take the first monotherapy exposure as t0.
-  - Apply the observation-window filters.
-  - Apply the washout against the target and its ATC4 comparators.
-  - Keep "pure mono" patients: exactly one *new* ingredient at t0, where chronic renewals are allowed.
-  - Collect de facto co-initiations: exactly two new ingredients on the same day.
+  - Every exposure date to the target is a candidate. t0 is the **first date that satisfies all criteria**:
+    - observation windows (365 days before, 182 days after);
+    - washout: no exposure to the target ingredients or their ATC4 comparators in the previous 365 days;
+    - the new-initiation counter (next bullets).
+  - A *new* ingredient is one absent in [d − 365 days, d). Chronic renewals are therefore not new.
+  - The **counter** always counts the target. Another new ingredient counts only if it passes the rules in `ProtocolConfig`, which use only information known at t0:
+    - it is in scope (`counter_scope="systemic"`): a catalog ingredient, or an ATC4 outside `excluded_atc_prefixes` (contrast agents, allergens, IV solutions, minerals, local-use groups…). Non-catalog ingredients without any ATC are ignored;
+    - it is not a short order: an "EHR order" of 1 to `short_order_max_days` (14) days with no refill is ignored;
+    - optional rules for audits: `ignore_local_routes` (non-systemic routes) and `ignore_procedural` (anesthetics N01A, curares M03A, reversal agents).
+  - A mono cohort needs exactly one counted new ingredient (the target, as monotherapy).
+  - De facto co-initiations are dates with exactly two counted new ingredients, both monotherapies. `days_supply` is empty in STARR, so the end date of EHR orders is the only prescribed-duration signal.
 
   Rows are tagged by `record_type` (0 = cohort, 1 = attrition counts, 2 = de facto rows). De facto rows and fixed-product passes build up in memory across the batch and are merged and exported at the end (`export_combination_cohorts`).
 - **`DrugCohort`** (`src/cohorts/cohort.py`) is saved to `<output_cohorts_dir>/cohort_<drug_id>/`. The folder holds `metadata.json` and `stanford_index.parquet` (person_id, t0, t_6m, t_12m, follow-up flags), plus `stanford_labs.parquet` (biomarkers written by `extract_biomarkers.py`; older cohorts used `biomarkers.parquet`) and optional `.npy` tensors (MOTOR z0 768-d, RABIT deltas, UKB Olink, k-means prototypes). `data/cohorts/manifest.parquet` records one row per drug (`status` SAVED/ZERO_PATIENT, `n_final_stanford`). Downstream steps filter on `status == "SAVED" & n_final_stanford >= min_n`.
@@ -72,7 +78,7 @@ To exercise a single drug, run `scripts/extract_cohorts.py --limit N`, run `audi
   - `combination` (`9…`, folders `cohort_9*`, scanned by `register_combination_cohorts`) is the **single cohort per ingredient pair**, merging fixed-product and de facto patients. It inherits the fixed product's descendant codes, so prescribed-code lookup resolves to it.
   - The pair index is keyed by `(kind, pair)` (`DrugCatalog.get_combination`). Build combination items only with `DrugCatalog.build_combination_item`, which sets `u = u_A + u_B` and uses the normalized mean of the two text embeddings.
 - **What each cohort contains:**
-  - A *monotherapy* cohort has exactly one new ingredient at t0, taken as monotherapy.
+  - A *monotherapy* cohort has exactly one counted new ingredient at t0 (the target, taken as monotherapy).
   - A *combination* cohort is the union of two sources, recorded per patient in the `stanford_index` column `combo_source`:
     - `fixed`: t0 is the first dispensing of the combined product, and its two ingredients are the only new ones at t0;
     - `de_facto`: exactly two new monotherapies at t0, and the patient must be captured by **both** monotherapy passes, so the washout covers both ATC4 classes.

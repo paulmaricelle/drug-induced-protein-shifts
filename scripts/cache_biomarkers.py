@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Génération du cache local Parquet pour les 6 biomarqueurs cibles.
 
-Scanne les 5000 shards .csv.zst de STARR OMOP et filtre exclusivement sur les
+Scanne les shards .csv.zst de STARR OMOP et filtre exclusivement sur les
 concepts LDL, HbA1c, eGFR, ALT, CRP et SBP.
 """
 
@@ -14,52 +14,19 @@ if str(ROOT_DIR) not in sys.path:
   sys.path.insert(0, str(ROOT_DIR))
 
 import duckdb
+from src.cohorts.biomarkers import all_concept_ids
 from src.config import PathConfig
 
-# Concepts cibles du protocole
-# scripts/cache_biomarkers.py (extrait de TARGET_CONCEPTS)
-
-# Concepts cibles du protocole
-TARGET_CONCEPTS = [
-    # LDL Cholesterol
-    3028288,
-    3027597,  # Ajout : concept LDL ciblé par extract_biomarkers.py
-    3027114,
-    3013444,
-    3025809,
-    # HbA1c
-    3004410,
-    3005673,
-    40762352,
-    # eGFR
-    3049187,
-    3053283,
-    3030354,
-    40764999,
-    # ALT
-    3006923,
-    3000676,
-    # CRP
-    3020460,
-    3010156,
-    3007461,
-    # Systolic BP
-    3004249,
-    3012888,
-    3034219,
-]
-
+# Concepts cibles du protocole : source unique src/cohorts/biomarkers.py
+TARGET_CONCEPTS = all_concept_ids()
 concepts_sql = ", ".join(str(c) for c in TARGET_CONCEPTS)
 
 
 def build_biomarkers_cache():
   paths = PathConfig(is_sample=False)
-  input_pattern = (
-      "/remote/private/starr_omop_deid/ro/STARR_OMOP_tables/"
-      "som-rit-phi-starr-prod.starr_omop_cdm54_confidential_lite_2026_07_22/"
-      "measurement/*.csv.zst"
-  )
+  input_pattern = str(paths.omop_dir / "measurement" / "*.csv.zst")
   output_parquet = paths.cache_dir / "biomarkers_measurements.parquet"
+  tmp_parquet = output_parquet.with_suffix(".tmp.parquet")
 
   print("=" * 80)
   print("CRÉATION DU CACHE LOCAL DES BIOMARQUEURS (STARR)")
@@ -81,22 +48,27 @@ def build_biomarkers_cache():
             TRY_CAST(person_id AS BIGINT) AS person_id,
             TRY_CAST(measurement_date AS DATE) AS measurement_date,
             TRY_CAST(measurement_concept_id AS BIGINT) AS measurement_concept_id,
-            TRY_CAST(value_as_number AS DOUBLE) AS value_as_number
+            TRY_CAST(value_as_number AS DOUBLE) AS value_as_number,
+            -- Unité indispensable à l'harmonisation (CRP en mg/dL ou mg/L, etc.)
+            TRY_CAST(unit_concept_id AS BIGINT) AS unit_concept_id
         FROM read_csv(
             '{input_pattern}',
             header = true,
             quote = '"',
             escape = '"',
             null_padding = true,
-            ignore_errors = true
+            ignore_errors = true,
+            union_by_name = true
         )
         WHERE TRY_CAST(measurement_concept_id AS BIGINT) IN ({concepts_sql})
           AND TRY_CAST(value_as_number AS DOUBLE) IS NOT NULL
-    ) TO '{output_parquet}' (FORMAT PARQUET, COMPRESSION ZSTD);
+    ) TO '{tmp_parquet}' (FORMAT PARQUET, COMPRESSION ZSTD);
     """
 
   print("\nExtraction et écriture en streaming Parquet en cours...")
   con.execute(query)
+  # Remplacement atomique : l'ancien cache reste valide en cas d'échec
+  tmp_parquet.replace(output_parquet)
 
   elapsed = time.time() - start_time
   size_mb = output_parquet.stat().st_size / (1024 * 1024)

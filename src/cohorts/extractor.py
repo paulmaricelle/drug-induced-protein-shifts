@@ -47,7 +47,8 @@ class CohortExtractor:
     # Détection d'un cache obsolète (généré par une ancienne version de build_cache.py)
     required_cols = {
         "person_id", "drug_concept_id", "exp_date", "ingredient_id",
-        "is_monotherapy",
+        "is_monotherapy", "exp_end_date", "drug_type_concept_id",
+        "route_concept_id", "refills",
     }
     found_cols = {
         row[0]
@@ -77,178 +78,241 @@ class CohortExtractor:
 
     self.con.execute(f"""
             CREATE OR REPLACE TABLE drug_exposure AS 
-            SELECT person_id, drug_concept_id, exp_date, ingredient_id, is_monotherapy
+            SELECT person_id, drug_concept_id, exp_date, ingredient_id, is_monotherapy,
+                   exp_end_date, drug_type_concept_id, route_concept_id, refills
             FROM read_parquet('{paths.drug_exposure_parquet}');
         """)
 
     self.con.execute("CREATE INDEX idx_exp_ing ON drug_exposure(ingredient_id);")
     self.con.execute("CREATE INDEX idx_exp_person ON drug_exposure(person_id);")
+    self._register_ingredient_flags()
     print("-> Cache DuckDB prêt.")
+
+  def _register_ingredient_flags(self) -> None:
+    """Table ing_flags : périmètre du compteur et agents procéduraux, par ingrédient.
+
+    in_scope : ingrédient du catalogue, ou ATC4 hors des groupes exclus
+    (protocol.excluded_atc_prefixes). Les ingrédients sans ATC hors catalogue
+    (excipients, solutés, extraits) sont hors périmètre.
+    """
+    p = self.protocol
+    atc = {}
+    names = {}
+    if self.paths.atc4_path.exists():
+      for row in pl.read_parquet(self.paths.atc4_path).iter_rows(named=True):
+        atc[int(row["ingredient_id"])] = str(row["atc4_code"])
+        names[int(row["ingredient_id"])] = str(row["ingredient_name"]).lower()
+    catalog_ids = {i.drug_id for i in self.catalog if i.kind == "monotherapy"}
+    for i in self.catalog:
+      if i.kind == "monotherapy" and i.atc4:
+        atc[i.drug_id] = i.atc4
+        names.setdefault(i.drug_id, i.name.lower())
+
+    records = []
+    for ing_id in set(atc) | catalog_ids:
+      code = atc.get(ing_id, "")
+      in_scope = ing_id in catalog_ids or (
+          bool(code) and not code.startswith(p.excluded_atc_prefixes)
+      )
+      procedural = bool(code) and code.startswith(p.procedural_atc_prefixes)
+      procedural |= names.get(ing_id, "") in p.procedural_ingredient_names
+      records.append({
+          "ingredient_id": ing_id, "in_scope": in_scope, "procedural": procedural,
+      })
+    self.con.register(
+        "ing_flags",
+        pl.DataFrame(records, schema={
+            "ingredient_id": pl.Int64, "in_scope": pl.Boolean, "procedural": pl.Boolean,
+        }),
+    )
 
   def get_atc4_comparators(self, target_id: int) -> list[int]:
     """Comparateurs du wash-out : classe(s) ATC4 de chaque ingrédient de la cible."""
     return self.catalog.get_comparator_ids(target_id)
 
+  # Type d'enregistrement OMOP "EHR order" : seule source d'une durée prescrite fiable
+  _EHR_ORDER_TYPE = 32833
+
+  def _counted_expr(self) -> str:
+    """Condition SQL : une nouvelle initiation non cible incrémente-t-elle le compteur ?"""
+    p = self.protocol
+    parts = []
+    if p.counter_scope == "systemic":
+      parts.append("in_scope")
+    elif p.counter_scope != "all":
+      raise ValueError(f"counter_scope inconnu : {p.counter_scope}")
+    if p.short_order_max_days > 0:
+      parts.append("NOT is_short")
+    if p.ignore_local_routes:
+      parts.append("NOT is_local")
+    if p.ignore_procedural:
+      parts.append("NOT procedural")
+    return " AND ".join(parts) or "TRUE"
+
   def _build_sql(self, target_id: int, kind: str) -> str:
     """Requête TTE commune aux monothérapies et aux bi-thérapies fixes.
+
+    t0 = première date d'exposition à la cible qui satisfait TOUS les critères :
+    fenêtres d'observation, wash-out (aucune exposition à la cible ni à ses
+    comparateurs ATC4 dans les 365 j précédents) et comptage des nouvelles
+    initiations du jour (cf. _counted_expr).
 
     Tables enregistrées au préalable :
       - target_ingredients   : ingrédients de la cible (1 pour mono, 2 pour fixe)
       - comparator_ingredients : comparateurs ATC4 (wash-out de classe)
       - target_codes         : codes prescrits de la bi-thérapie fixe (kind fixe)
+      - ing_flags            : périmètre du compteur (cf. _register_ingredient_flags)
     """
     p = self.protocol
     is_fixed = kind == "fixed_combination"
+    local_routes = ", ".join(str(r) for r in p.local_route_concept_ids) or "NULL"
+    short_days = max(p.short_order_max_days, 0)
 
     if is_fixed:
-      # t0 = première dispensation du comprimé combiné
+      # Dispensations du comprimé combiné
       target_filter = (
           "drug_concept_id IN (SELECT drug_concept_id FROM target_codes)"
       )
-      # Seuls les 2 ingrédients du comprimé sont nouveaux à t0
-      final_filter = "c.n_new_drugs = 2 AND c.n_new_targets = 2"
+      # Seuls les 2 ingrédients du comprimé sont de nouvelles initiations comptées
+      final_filter = "n_new = 2 AND n_new_targets = 2"
     else:
-      # t0 = première exposition à la molécule cible sous forme MONOTHÉRAPIE
+      # Expositions à la molécule cible sous forme MONOTHÉRAPIE
       target_filter = f"ingredient_id = {target_id} AND is_monotherapy = TRUE"
-      # 1 seule NOUVELLE molécule initiée à t0 (la cible) sous forme mono
-      # (les renouvellements d'ordonnances chroniques pré-existantes n'excluent pas le patient)
-      final_filter = "c.n_new_drugs = 1 AND c.all_monotherapies = TRUE"
+      # 1 seule nouvelle initiation comptée (la cible), sous forme mono
+      final_filter = "n_new = 1 AND all_mono"
 
     # Bi-thérapies de facto : collectées uniquement depuis les passes monothérapie
     de_facto_select = "" if is_fixed else f"""
-        -- RECORD 2 : Paires de facto
+        -- RECORD 2 : Co-initiations de facto (toutes dates éligibles, la fusion
+        -- retient la plus précoce commune aux deux passes)
         UNION ALL
-        SELECT 
+        SELECT
             2::TINYINT,
-            person_id,
-            t0,
-            t_6m,
-            t_12m,
-            history_days_prior,
-            follow_up_days,
-            has_12m_followup,
-            ingredient_id AS other_ingredient_id,
+            c.person_id,
+            c.d,
+            (c.d + INTERVAL '{p.obs_post_days} days')::DATE,
+            (c.d + INTERVAL '{p.followup_12m_days} days')::DATE,
+            (c.d - w.obs_start)::INTEGER,
+            (w.obs_end - c.d)::INTEGER,
+            ((w.obs_end - c.d) >= {p.followup_12m_days})::BOOLEAN,
+            c.ingredient_id AS other_ingredient_id,
             NULL::BIGINT
-        FROM co_initiations_de_facto
-        WHERE ingredient_id != {target_id}"""
+        FROM counted c
+        JOIN per_d pd ON pd.person_id = c.person_id AND pd.d = c.d
+        JOIN wo_ok w ON w.person_id = c.person_id AND w.d = c.d
+        WHERE pd.n_new = 2 AND pd.all_mono AND c.counted AND NOT c.is_target"""
 
     return f"""
-        WITH 
-        -- 1. Date candidate t0
+        WITH
+        -- 1. Dates candidates : expositions à la cible
         target_exposures AS (
-            SELECT DISTINCT person_id, exp_date
+            SELECT DISTINCT person_id, exp_date AS d
             FROM drug_exposure
             WHERE {target_filter}
         ),
-        candidate_t0 AS (
-            SELECT 
-                person_id,
-                MIN(exp_date) AS t0,
-                (MIN(exp_date) + INTERVAL '{p.obs_post_days} days')::DATE AS t_6m,
-                (MIN(exp_date) + INTERVAL '{p.followup_12m_days} days')::DATE AS t_12m
-            FROM target_exposures
-            GROUP BY person_id
+        -- 2. Fenêtres d'observation : >= 365 j avant et >= 182 j après la date
+        obs_ok AS (
+            SELECT t.person_id, t.d, po.obs_start, po.obs_end
+            FROM target_exposures t
+            JOIN observation_period po
+              ON t.person_id = po.person_id
+             AND t.d >= po.obs_start AND t.d <= po.obs_end
+            WHERE (t.d - po.obs_start) >= {p.obs_pre_days}
+              AND (po.obs_end - t.d) >= {p.obs_post_days}
+        ),
+        -- 3. Wash-out : aucune exposition à un ingrédient cible (toute forme)
+        -- ni à un comparateur ATC4 dans les {p.washout_days} j précédant la date
+        washout_set AS (
+            SELECT DISTINCT person_id, exp_date
+            FROM drug_exposure
+            WHERE ingredient_id IN (SELECT ingredient_id FROM target_ingredients)
+               OR ingredient_id IN (SELECT ingredient_id FROM comparator_ingredients)
+        ),
+        lagged AS (
+            SELECT person_id, exp_date,
+                   LAG(exp_date) OVER (PARTITION BY person_id ORDER BY exp_date) AS prev
+            FROM washout_set
+        ),
+        wo_ok AS (
+            SELECT o.*
+            FROM obs_ok o
+            JOIN lagged l ON l.person_id = o.person_id AND l.exp_date = o.d
+            WHERE l.prev IS NULL OR (o.d - l.prev) >= {p.washout_days}
         ),
 
-        -- 2. Critères d'observation : >= 365j avant t0 et >= 182j après t0
-        step_1_obs_valid AS (
-            SELECT 
-                c.person_id,
-                c.t0,
-                c.t_6m,
-                c.t_12m,
-                (c.t0 - po.obs_start)::INTEGER AS history_days_prior,
-                (po.obs_end - c.t0)::INTEGER AS follow_up_days,
-                ((po.obs_end - c.t0) >= {p.followup_12m_days})::BOOLEAN AS has_12m_followup
-            FROM candidate_t0 c
-            JOIN observation_period po 
-              ON c.person_id = po.person_id
-             AND c.t0 >= po.obs_start 
-             AND c.t0 <= po.obs_end
-            WHERE (c.t0 - po.obs_start) >= {p.obs_pre_days}
-              AND (po.obs_end - c.t0) >= {p.obs_post_days}
+        -- 4. Nouvelles initiations du jour : ingrédient absent de [d - 365 j, d[
+        at_d AS (
+            SELECT w.person_id, w.d, de.ingredient_id, de.is_monotherapy,
+                   de.drug_type_concept_id, de.route_concept_id,
+                   de.exp_end_date, de.refills
+            FROM wo_ok w
+            JOIN drug_exposure de ON de.person_id = w.person_id AND de.exp_date = w.d
+        ),
+        seen_before AS (
+            SELECT DISTINCT a.person_id, a.d, a.ingredient_id
+            FROM (SELECT DISTINCT person_id, d, ingredient_id FROM at_d) a
+            JOIN drug_exposure de
+              ON de.person_id = a.person_id AND de.ingredient_id = a.ingredient_id
+             AND de.exp_date >= (a.d - INTERVAL '{p.washout_days} days')
+             AND de.exp_date < a.d
+        ),
+        new_rows AS (
+            SELECT a.* FROM at_d a
+            ANTI JOIN seen_before s
+              ON s.person_id = a.person_id AND s.d = a.d
+             AND s.ingredient_id = a.ingredient_id
+        ),
+        -- Classement par ingrédient, avec la seule information disponible à t0
+        new_ingredients AS (
+            SELECT person_id, d, ingredient_id,
+                BOOL_AND(is_monotherapy) AS all_mono,
+                -- Ponctuel : uniquement des ordonnances de 1..{short_days} j sans renouvellement
+                BOOL_AND(COALESCE(
+                    drug_type_concept_id = {self._EHR_ORDER_TYPE}
+                    AND (exp_end_date - d) BETWEEN 1 AND {short_days}
+                    AND COALESCE(refills, 0) = 0, FALSE)) AS is_short,
+                -- Local : uniquement des voies non systémiques
+                BOOL_AND(COALESCE(route_concept_id IN ({local_routes}), FALSE)) AS is_local
+            FROM new_rows
+            GROUP BY 1, 2, 3
+        ),
+        counted AS (
+            SELECT n.*,
+                   (n.ingredient_id IN (SELECT ingredient_id FROM target_ingredients)) AS is_target,
+                   (n.ingredient_id IN (SELECT ingredient_id FROM target_ingredients))
+                     OR ({self._counted_expr()}) AS counted
+            FROM (
+                SELECT n.*, COALESCE(f.in_scope, FALSE) AS in_scope,
+                       COALESCE(f.procedural, FALSE) AS procedural
+                FROM new_ingredients n
+                LEFT JOIN ing_flags f ON f.ingredient_id = n.ingredient_id
+            ) n
+        ),
+        per_d AS (
+            SELECT person_id, d,
+                COUNT(*) FILTER (WHERE counted)::INTEGER AS n_new,
+                COUNT(*) FILTER (WHERE counted AND is_target)::INTEGER AS n_new_targets,
+                COALESCE(BOOL_AND(all_mono) FILTER (WHERE counted), TRUE) AS all_mono
+            FROM counted
+            GROUP BY 1, 2
         ),
 
-        -- 3. Historique d'exposition durant l'année de baseline [t0 - 365j, t0[
-        baseline_exposures AS (
-            SELECT DISTINCT de.person_id, de.ingredient_id
-            FROM drug_exposure de
-            JOIN step_1_obs_valid s ON de.person_id = s.person_id
-            WHERE de.exp_date >= (s.t0 - INTERVAL '{p.washout_days} days')
-              AND de.exp_date < s.t0
-        ),
-
-        -- Wash-out strict (365j) : exclusion si prise antérieure d'un ingrédient cible
-        -- (sous toute forme) OU d'un comparateur ATC4
-        prior_washout_violations AS (
-            SELECT DISTINCT b.person_id
-            FROM baseline_exposures b
-            WHERE b.ingredient_id IN (SELECT ingredient_id FROM target_ingredients)
-               OR b.ingredient_id IN (SELECT ingredient_id FROM comparator_ingredients)
-        ),
-        step_2_washout_valid AS (
-            SELECT s.*
-            FROM step_1_obs_valid s
-            WHERE s.person_id NOT IN (SELECT person_id FROM prior_washout_violations)
-        ),
-
-        -- 4. Prescriptions délivrées le jour t0
-        prescriptions_at_t0 AS (
-            SELECT 
-                de.person_id,
-                de.ingredient_id,
-                de.is_monotherapy,
-                s.t0,
-                s.t_6m,
-                s.t_12m,
-                s.history_days_prior,
-                s.follow_up_days,
-                s.has_12m_followup
-            FROM drug_exposure de
-            JOIN step_2_washout_valid s 
-              ON de.person_id = s.person_id 
-             AND de.exp_date = s.t0
-        ),
-
-        -- Une molécule à t0 est NOUVELLE si elle n'a jamais été vue en baseline [t0 - 365j, t0[
-        new_initiations_at_t0 AS (
-            SELECT p.*
-            FROM prescriptions_at_t0 p
-            LEFT JOIN baseline_exposures b 
-                   ON p.person_id = b.person_id 
-                  AND p.ingredient_id = b.ingredient_id
-            WHERE b.ingredient_id IS NULL
-        ),
-
-        -- Décompte des NOUVEAUX principes actifs initiés à t0
-        patient_new_counts AS (
-            SELECT 
-                person_id,
-                COUNT(DISTINCT ingredient_id)::INTEGER AS n_new_drugs,
-                COUNT(DISTINCT ingredient_id) FILTER (
-                    WHERE ingredient_id IN (SELECT ingredient_id FROM target_ingredients)
-                )::INTEGER AS n_new_targets,
-                BOOL_AND(is_monotherapy) AS all_monotherapies
-            FROM new_initiations_at_t0
-            GROUP BY person_id
-        ),
-
-        step_3_final AS (
-            SELECT s.*
-            FROM step_2_washout_valid s
-            JOIN patient_new_counts c 
-              ON s.person_id = c.person_id
+        -- 5. t0 = première date éligible
+        t0_sel AS (
+            SELECT person_id, MIN(d) AS t0
+            FROM per_d
             WHERE {final_filter}
+            GROUP BY 1
         ),
-
-        -- Bi-thérapie de facto : exactement 2 NOUVELLES molécules mono initiées le même jour
-        co_initiations_de_facto AS (
-            SELECT n.*
-            FROM new_initiations_at_t0 n
-            JOIN patient_new_counts c 
-              ON n.person_id = c.person_id
-            WHERE c.n_new_drugs = 2 
-              AND c.all_monotherapies = TRUE
+        step_final AS (
+            SELECT t.person_id, t.t0,
+                (t.t0 + INTERVAL '{p.obs_post_days} days')::DATE AS t_6m,
+                (t.t0 + INTERVAL '{p.followup_12m_days} days')::DATE AS t_12m,
+                (t.t0 - w.obs_start)::INTEGER AS history_days_prior,
+                (w.obs_end - t.t0)::INTEGER AS follow_up_days,
+                ((w.obs_end - t.t0) >= {p.followup_12m_days})::BOOLEAN AS has_12m_followup
+            FROM t0_sel t
+            JOIN wo_ok w ON w.person_id = t.person_id AND w.d = t.t0
         )
 
         -- RECORD 0 : Cohorte cible
@@ -263,17 +327,17 @@ class CohortExtractor:
             has_12m_followup,
             NULL::BIGINT AS other_ingredient_id,
             NULL::BIGINT AS n_patients
-        FROM step_3_final
+        FROM step_final
 
-        -- RECORD 1 : Comptes d'attrition
+        -- RECORD 1 : Attrition (patients ayant au moins une date passant l'étape)
         UNION ALL
-        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(*)::BIGINT FROM candidate_t0
+        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(DISTINCT person_id)::BIGINT FROM target_exposures
         UNION ALL
-        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(*)::BIGINT FROM step_1_obs_valid
+        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(DISTINCT person_id)::BIGINT FROM obs_ok
         UNION ALL
-        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(*)::BIGINT FROM step_2_washout_valid
+        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(DISTINCT person_id)::BIGINT FROM wo_ok
         UNION ALL
-        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(*)::BIGINT FROM step_3_final
+        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(*)::BIGINT FROM step_final
         {de_facto_select};
         """
 
