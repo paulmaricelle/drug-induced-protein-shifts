@@ -8,6 +8,8 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from src.config import PathConfig
+
 VOCAB_DIR = Path("/remote/shared/collab/omop-vocabularies/v20250227")
 OUT_PATH = ROOT_DIR / "data" / "ingredient_to_atc4.parquet"
 OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -25,6 +27,57 @@ def build_atc4_mapping() -> None:
     con.execute("PRAGMA threads=16;")
     con.execute("PRAGMA max_memory='32GB';")
     con.execute("PRAGMA preserve_insertion_order=false;")
+
+    # Vote majoritaire : chaque ATC4 candidat est pondéré par le nombre d'expositions
+    # STARR à des formes mono-ingrédient qui en descendent (ex. dexaméthasone :
+    # H02AB systémique plutôt que A01AC stomatologique, premier par ordre alphabétique).
+    # Les liens ATC du vocabulaire sont posés par groupe de formes (ex. "Topical" ->
+    # C05AA et D07AB) : chaque forme répartit ses expositions entre ses k ATC4 (1/k),
+    # puis égalité départagée hors groupe V, puis par le nombre de formes rattachées.
+    paths = PathConfig(is_sample=False)
+    if paths.drug_exposure_parquet.exists() and paths.mapping_path.exists():
+        print("Vote majoritaire à partir des expositions du cache STARR...")
+        con.execute(f"""
+            CREATE TABLE form_expo AS
+            SELECT m.ingredient_id::BIGINT AS ingredient_id,
+                   m.drug_concept_id::BIGINT AS drug_concept_id,
+                   COALESCE(e.n, 0) AS n
+            FROM read_parquet('{paths.mapping_path}') m
+            LEFT JOIN (
+                SELECT drug_concept_id, COUNT(*) AS n
+                FROM read_parquet('{paths.drug_exposure_parquet}')
+                GROUP BY 1
+            ) e ON e.drug_concept_id = m.drug_concept_id
+            -- Codes au niveau ingrédient exclus : ils héritent des ATC de toutes les associations
+            WHERE m.is_monotherapy AND m.drug_concept_id <> m.ingredient_id
+        """)
+        con.execute(f"""
+            CREATE TABLE atc4_votes AS
+            WITH atc5 AS (
+                SELECT concept_id::BIGINT AS atc_concept_id, SUBSTRING(concept_code, 1, 5) AS atc4_code
+                FROM read_parquet('{VOCAB_DIR}/CONCEPT.parquet')
+                WHERE vocabulary_id = 'ATC' AND concept_class_id = 'ATC 5th'
+            ),
+            links AS (
+                SELECT DISTINCT f.ingredient_id, a.atc4_code, f.drug_concept_id, f.n
+                FROM read_csv('{VOCAB_DIR}/CONCEPT_ANCESTOR.csv', auto_detect=true) ca
+                JOIN atc5 a ON ca.ancestor_concept_id::BIGINT = a.atc_concept_id
+                JOIN form_expo f ON ca.descendant_concept_id::BIGINT = f.drug_concept_id
+            )
+            , weighted AS (
+                SELECT *, n / COUNT(*) OVER (PARTITION BY ingredient_id, drug_concept_id) AS w
+                FROM links
+            )
+            SELECT ingredient_id, atc4_code, SUM(w)::DOUBLE AS vote,
+                   SUM(n)::BIGINT AS n_expo, COUNT(*) AS n_forms
+            FROM weighted GROUP BY 1, 2
+        """)
+    else:
+        print("[Avertissement] Cache STARR absent : départage alphabétique (moins fiable).")
+        con.execute(
+            "CREATE TABLE atc4_votes (ingredient_id BIGINT, atc4_code VARCHAR,"
+            " vote DOUBLE, n_expo BIGINT, n_forms BIGINT)"
+        )
 
     query = f"""
     COPY (
@@ -99,20 +152,30 @@ def build_atc4_mapping() -> None:
                 m.atc4_code,
                 a4.atc_name AS atc4_name,
                 a4.atc_concept_id AS atc4_concept_id,
+                COALESCE(v.n_expo, 0) AS atc4_n_expo,
+                COALESCE(v.vote, 0) AS atc4_vote,
+                COUNT(DISTINCT m.atc4_code) OVER (PARTITION BY m.ingredient_id) AS n_atc4_candidates,
                 ROW_NUMBER() OVER (
                     PARTITION BY m.ingredient_id 
-                    ORDER BY m.rank_rel ASC, m.rank_mono ASC, m.atc_code ASC
+                    ORDER BY m.rank_rel ASC, COALESCE(v.vote, 0) DESC,
+                             (m.atc4_code LIKE 'V%') ASC,  -- groupe V (diagnostic, divers) en dernier
+                             COALESCE(v.n_forms, 0) DESC, m.rank_mono ASC, m.atc_code ASC
                 ) AS rn
             FROM matched m
             JOIN atc_concepts a4 ON m.atc4_code = a4.atc_code 
                                 AND (a4.concept_class_id = 'ATC 4th' OR LENGTH(a4.atc_code) = 5)
+            LEFT JOIN atc4_votes v ON v.ingredient_id = m.ingredient_id
+                                  AND v.atc4_code = m.atc4_code
         )
         SELECT 
             ingredient_id,
             ingredient_name,
             atc4_code,
             atc4_name,
-            atc4_concept_id
+            atc4_concept_id,
+            atc4_n_expo,
+            atc4_vote,
+            n_atc4_candidates
         FROM ranked
         WHERE rn = 1
         ORDER BY ingredient_id
@@ -128,6 +191,11 @@ def build_atc4_mapping() -> None:
     print(f"\nMapping ATC4 officiel généré en {elapsed:.1f} secondes :")
     print(f"  * Ingrédients cartographiés sans ambiguïté : {n_rows:,}")
     print(f"  * Classes ATC4 distinctes couvertes       : {n_atc:,}")
+    n_amb, n_voted = con.execute(f"""
+        SELECT COUNT(*) FILTER (WHERE n_atc4_candidates > 1),
+               COUNT(*) FILTER (WHERE n_atc4_candidates > 1 AND atc4_n_expo > 0)
+        FROM read_parquet('{OUT_PATH}')""").fetchone()
+    print(f"  * Ingrédients à plusieurs ATC4 candidats  : {n_amb:,} (dont {n_voted:,} départagés par vote)")
     print("=" * 80)
 
 

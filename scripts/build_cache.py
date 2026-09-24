@@ -61,6 +61,7 @@ def build_cache(sample_ratio: float = 1.0) -> None:
 
     obs_out = paths.observation_period_parquet
     drug_out = paths.drug_exposure_parquet
+    drug_tmp = drug_out.with_suffix(".tmp.parquet")
 
     print(f"\n{'='*75}")
     mode_str = (
@@ -112,16 +113,23 @@ def build_cache(sample_ratio: float = 1.0) -> None:
                 de.drug_concept_id::BIGINT AS drug_concept_id,
                 TRY_CAST(de.drug_exposure_start_date AS DATE) AS exp_date,
                 m.ingredient_id::BIGINT AS ingredient_id,
-                m.is_monotherapy::BOOLEAN AS is_monotherapy
-            FROM read_csv('{drug_glob}', auto_detect=true) de
+                m.is_monotherapy::BOOLEAN AS is_monotherapy,
+                -- Informations connues à t0 pour classer une prescription ponctuelle
+                TRY_CAST(de.drug_exposure_end_date AS DATE) AS exp_end_date,
+                TRY_CAST(de.drug_type_concept_id AS BIGINT) AS drug_type_concept_id,
+                TRY_CAST(de.route_concept_id AS BIGINT) AS route_concept_id,
+                TRY_CAST(de.refills AS INTEGER) AS refills
+            FROM read_csv('{drug_glob}', auto_detect=true, union_by_name=true) de
             SEMI JOIN base_cohort bc 
                 ON de.person_id = bc.person_id
             JOIN read_parquet('{map_file}') m 
             ON de.drug_concept_id = m.drug_concept_id
             WHERE TRY_CAST(de.drug_exposure_start_date AS DATE) IS NOT NULL
-        ) TO '{drug_out}' (FORMAT PARQUET);
+        ) TO '{drug_tmp}' (FORMAT PARQUET);
     """
+    # Écriture dans un fichier temporaire : le cache existant reste valide en cas d'échec
     con.execute(drug_query)
+    drug_tmp.replace(drug_out)
     n_records = con.execute(f"SELECT COUNT(*) FROM read_parquet('{drug_out}')").fetchone()[0]
     print(f"✓ Expositions indexées : {n_records:,} (en {time.time() - t0_step:.1f}s)")
 
