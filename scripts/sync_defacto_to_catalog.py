@@ -19,17 +19,19 @@ def sync_defacto_combinations():
     loaded = DrugCatalog.load(catalog_file)
     initial_count = len(loaded)
 
-    # Purge des de facto existants : le catalogue reflète exactement les cohortes sur disque
-    catalog = loaded.without_kind("de_facto_combination")
+    # Purge des bi-thérapies existantes (et de l'ancien kind de facto) : le catalogue
+    # reflète exactement les cohortes sur disque. Les fixed_combination sont gardées
+    # comme recettes d'extraction.
+    catalog = loaded.without_kind("combination").without_kind("de_facto_combination")
     n_purged = initial_count - len(catalog)
 
-    print(f"Analyse des dossiers de bi-thérapies de facto dans {cohorts_dir}...")
-    n_added = catalog.register_de_facto_cohorts(cohorts_dir)
+    print(f"Analyse des dossiers de bi-thérapies dans {cohorts_dir}...")
+    n_added = catalog.register_combination_cohorts(cohorts_dir)
 
     print(f"\nBilan de synchronisation :")
     print(f"  * Items initiaux dans le catalogue : {initial_count:,}")
-    print(f"  * Anciennes de facto retirées       : {n_purged:,}")
-    print(f"  * Bi-thérapies de facto intégrées   : {n_added:,}")
+    print(f"  * Anciennes bi-thérapies retirées   : {n_purged:,}")
+    print(f"  * Bi-thérapies intégrées            : {n_added:,}")
     print(f"  * Total final du catalogue         : {len(catalog):,}")
 
     # Sauvegarde sur disque pour figer l'état

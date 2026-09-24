@@ -32,6 +32,8 @@ class CohortExtractor:
 
     # (ing_a, ing_b) -> lignes de co-initiation, annotées par la molécule source
     self.de_facto_pairs: dict[tuple[int, int], list[dict]] = {}
+    # (ing_a, ing_b) -> stanford_index de la passe comprimé combiné
+    self.fixed_pairs: dict[tuple[int, int], pl.DataFrame] = {}
     self._init_duckdb_cache()
 
   def _init_duckdb_cache(self) -> None:
@@ -280,14 +282,18 @@ class CohortExtractor:
       target_id: int,
       comparator_ids: list[int] | None = None,
   ) -> DrugCohort | None:
-    """Extrait la cohorte d'une monothérapie ou d'une bi-thérapie fixe du catalogue."""
+    """Extrait la cohorte d'une monothérapie ou d'une bi-thérapie fixe du catalogue.
+
+    La cohorte fixe n'est pas une cohorte finale : elle est conservée en
+    mémoire et fusionnée par export_combination_cohorts().
+    """
     item = self.catalog.get(target_id)
     if item is None:
       raise KeyError(f"Molécule {target_id} introuvable dans le DrugCatalog.")
     if item.kind not in ("monotherapy", "fixed_combination"):
       raise ValueError(
           f"{item.name} ({item.kind}) : les de facto sont exportées via"
-          " export_valid_de_facto_cohorts()."
+          " export_combination_cohorts()."
       )
 
     # Résolution automatique des comparateurs ATC4 si non spécifiés
@@ -336,6 +342,10 @@ class CohortExtractor:
         .sort(["person_id", "t0"])
     )
 
+    if item.kind == "fixed_combination" and len(stanford_index) > 0:
+      pair_key = tuple(sorted(item.ingredient_concept_ids))
+      self.fixed_pairs[pair_key] = stanford_index
+
     if len(stanford_index) == 0:
       return None
 
@@ -343,31 +353,69 @@ class CohortExtractor:
         drug_item=item, stanford_index=stanford_index
     )
 
-  def export_valid_de_facto_cohorts(
+  def export_combination_cohorts(
       self, min_size: int | None = None
   ) -> list[DrugCohort]:
-    """Construit les cohortes de facto à partir des co-initiations collectées.
+    """Construit une cohorte unique (kind combination) par couple d'ingrédients.
 
-    Un patient n'est retenu que s'il a été capté par les passes des DEUX
-    ingrédients au même t0, c.-à-d. s'il satisfait le wash-out de la classe
-    ATC4 de A ET de celle de B. Les deux monothérapies doivent donc avoir été
-    extraites dans la même exécution.
+    Fusionne deux sources, tracées par patient dans la colonne combo_source :
+      - fixed    : patients de la passe comprimé combiné (extract_cohort) ;
+      - de_facto : co-initiations captées par les passes des DEUX ingrédients
+                   au même t0 (wash-out des classes ATC4 de A ET de B). Les deux
+                   monothérapies doivent avoir été extraites dans la même exécution.
+    Un patient présent dans les deux sources garde le t0 le plus précoce.
+    Le seuil min_size ne s'applique qu'aux couples sans comprimé combiné
+    (les cohortes fixes sont conservées dès N >= 1, comme les monothérapies).
     """
-    valid_cohorts = []
     threshold = (
         min_size if min_size is not None else self.protocol.min_de_facto_size
     )
+    index_cols = [
+        "person_id",
+        "t0",
+        "t_6m",
+        "t_12m",
+        "history_days_prior",
+        "follow_up_days",
+        "has_12m_followup",
+    ]
 
-    for (ing_a, ing_b), pts in self.de_facto_pairs.items():
-      sources: dict[tuple[int, object], set[int]] = {}
-      rows: dict[tuple[int, object], dict] = {}
-      for r in pts:
-        key = (r["person_id"], r["t0"])
-        sources.setdefault(key, set()).add(r["source_id"])
-        rows.setdefault(key, r)
+    valid_cohorts = []
+    for ing_a, ing_b in sorted(set(self.de_facto_pairs) | set(self.fixed_pairs)):
+      parts = []
 
-      valid_keys = [k for k, s in sources.items() if {ing_a, ing_b} <= s]
-      if len(valid_keys) < threshold:
+      pts = self.de_facto_pairs.get((ing_a, ing_b), [])
+      if pts:
+        sources: dict[tuple[int, object], set[int]] = {}
+        rows: dict[tuple[int, object], dict] = {}
+        for r in pts:
+          key = (r["person_id"], r["t0"])
+          sources.setdefault(key, set()).add(r["source_id"])
+          rows.setdefault(key, r)
+        valid_keys = [k for k, s in sources.items() if {ing_a, ing_b} <= s]
+        if valid_keys:
+          parts.append(
+              pl.DataFrame([rows[k] for k in valid_keys])
+              .select(index_cols)
+              .with_columns(pl.lit("de_facto").alias("combo_source"))
+          )
+
+      fixed_df = self.fixed_pairs.get((ing_a, ing_b))
+      if fixed_df is not None:
+        parts.append(
+            fixed_df.select(index_cols).with_columns(
+                pl.lit("fixed").alias("combo_source")
+            )
+        )
+
+      if not parts:
+        continue
+      df_pts = (
+          pl.concat(parts, how="vertical_relaxed")
+          .sort(["person_id", "t0", "combo_source"], descending=[False, False, True])
+          .unique(subset=["person_id"], keep="first", maintain_order=True)
+      )
+      if fixed_df is None and len(df_pts) < threshold:
         continue
 
       item_a = self.catalog.get(ing_a)
@@ -375,28 +423,18 @@ class CohortExtractor:
       if item_a is None or item_b is None:
         continue
 
-      df_pts = (
-          pl.DataFrame([rows[k] for k in valid_keys])
-          .select([
-              "person_id",
-              "t0",
-              "t_6m",
-              "t_12m",
-              "history_days_prior",
-              "follow_up_days",
-              "has_12m_followup",
-          ])
-          .sort(["person_id", "t0"])
-      )
-
-      combo_item = self.catalog.get_combination(
-          "de_facto_combination", ing_a, ing_b
-      ) or self.catalog.build_combination_item(
-          "de_facto_combination", item_a, item_b
-      )
-      assert combo_item.drug_id == combo_drug_id(
-          "de_facto_combination", ing_a, ing_b
-      )
+      combo_item = self.catalog.get_combination("combination", ing_a, ing_b)
+      if combo_item is None:
+        fixed_item = self.catalog.get_combination(
+            "fixed_combination", ing_a, ing_b
+        )
+        combo_item = self.catalog.build_combination_item(
+            "combination", item_a, item_b,
+            descendant_concept_ids=(
+                set(fixed_item.descendant_concept_ids) if fixed_item else None
+            ),
+        )
+      assert combo_item.drug_id == combo_drug_id("combination", ing_a, ing_b)
 
       valid_cohorts.append(
           DrugCohort.from_drug_item(drug_item=combo_item, stanford_index=df_pts)

@@ -105,7 +105,7 @@ def audit_catalog():
     # Simulation : un patient prend simultanément deux monothérapies sans formulation fixe
     # Prenons deux médicaments au hasard
     mono_a, mono_b = monos[0], monos[1]
-    de_facto = catalog.get_or_create_de_facto_combination(mono_a.drug_id, mono_b.drug_id)
+    de_facto = catalog.get_or_create_combination(mono_a.drug_id, mono_b.drug_id)
 
     print(f"Création à la volée : {de_facto.name}")
     print(f" - ID synthétique déterministe : {de_facto.drug_id}")
@@ -116,7 +116,7 @@ def audit_catalog():
     print(f" - Écart vectoriel u_{{A+B}} : {diff_df:.2e} [OK]")
 
     # Vérification idempotence (ne doit pas recréer un deuxième objet si rappelé)
-    de_facto_2 = catalog.get_or_create_de_facto_combination(mono_b.drug_id, mono_a.drug_id)
+    de_facto_2 = catalog.get_or_create_combination(mono_b.drug_id, mono_a.drug_id)
     assert de_facto.drug_id == de_facto_2.drug_id, "L'ordre des ingrédients doit être invariant !"
     print(f" - Invariance par permutation de l'ordre d'appel : [OK]")
 

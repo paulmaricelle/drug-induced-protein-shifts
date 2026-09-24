@@ -10,18 +10,20 @@ import numpy as np
 import polars as pl
 
 # Préfixes des IDs synthétiques (13 chiffres, sans collision avec les concept_id OMOP)
-# -> dossiers cohort_8* (bi-thérapies fixes) et cohort_9* (bi-thérapies de facto)
+# - fixed_combination (8…) : recette d'extraction du comprimé combiné, sans cohorte propre
+# - combination (9…, dossiers cohort_9*) : cohorte unique par couple d'ingrédients,
+#   fusion des patients fixes et de facto
 _COMBO_ID_OFFSET = {
     "fixed_combination": 8_000_000_000_000,
-    "de_facto_combination": 9_000_000_000_000,
+    "combination": 9_000_000_000_000,
 }
 
 
 def combo_drug_id(kind: str, ing_id_a: int, ing_id_b: int) -> int:
     """ID 64-bit déterministe d'une bi-thérapie, invariant par permutation des ingrédients."""
     a, b = sorted((int(ing_id_a), int(ing_id_b)))
-    # Clé historique "a_b" conservée pour les de facto (IDs déjà publiés)
-    key = f"{a}_{b}" if kind == "de_facto_combination" else f"{kind}_{a}_{b}"
+    # Clé historique "a_b" (ex-de facto) conservée pour les bi-thérapies fusionnées
+    key = f"{a}_{b}" if kind == "combination" else f"{kind}_{a}_{b}"
     digest = hashlib.md5(key.encode()).hexdigest()
     return int(digest[:12], 16) % (10**12) + _COMBO_ID_OFFSET[kind]
 
@@ -44,7 +46,7 @@ class DrugItem:
 
     drug_id: int  # OMOP ingredient_concept_id (ou ID synthétique négatif pour combo)
     name: str
-    kind: str  # 'monotherapy', 'fixed_combination', 'de_facto_combination'
+    kind: str  # 'monotherapy', 'fixed_combination', 'combination'
 
     # Ingrédients constitutifs
     ingredient_concept_ids: list[int] = field(default_factory=list)
@@ -121,7 +123,8 @@ class DrugCatalog:
 
     def __init__(self, items: list[DrugItem] | None = None):
         self._items: dict[int, DrugItem] = {}
-        # (kind, (ing_a, ing_b)) -> drug_id : une même paire peut exister en fixe ET de facto
+        # (kind, (ing_a, ing_b)) -> drug_id : une même paire existe en fixed_combination
+        # (recette d'extraction) ET en combination (cohorte fusionnée)
         self._pair_to_combo_id: dict[tuple[str, tuple[int, int]], int] = {}
         self._descendant_to_drug_id: dict[int, int] = {}
         self._atc4_to_drug_ids: dict[str, set[int]] = {}
@@ -201,12 +204,13 @@ class DrugCatalog:
         name: str | None = None,
         descendant_concept_ids: set[int] | None = None,
     ) -> DrugItem:
-        """Construit une bi-thérapie (fixe ou de facto) à partir de ses deux ingrédients."""
+        """Construit une bi-thérapie (fixe ou fusionnée) à partir de ses deux ingrédients."""
         a, b = sorted([item_a, item_b], key=lambda it: it.drug_id)
         if name is None:
-            suffix = "(Fixed Dose)" if kind == "fixed_combination" else "(De Facto)"
-            sep = " / " if kind == "fixed_combination" else " + "
-            name = f"{a.name}{sep}{b.name} {suffix}"
+            if kind == "fixed_combination":
+                name = f"{a.name} / {b.name} (Fixed Dose)"
+            else:
+                name = f"{a.name} + {b.name}"
 
         # u_{A+B} = u_A + u_B (Section 3.3)
         u_combo = None
@@ -234,11 +238,11 @@ class DrugCatalog:
             text_embedding=text_combo,
         )
 
-    def get_or_create_de_facto_combination(
+    def get_or_create_combination(
         self, ing_id_a: int, ing_id_b: int
     ) -> DrugItem:
-        """Récupère ou instancie à la volée une bi-thérapie prescrite conjointement (Section 3.3)."""
-        existing = self.get_combination("de_facto_combination", ing_id_a, ing_id_b)
+        """Récupère ou instancie à la volée la bi-thérapie d'un couple d'ingrédients (Section 3.3)."""
+        existing = self.get_combination("combination", ing_id_a, ing_id_b)
         if existing is not None:
             return existing
 
@@ -247,8 +251,10 @@ class DrugCatalog:
         if not item_a or not item_b:
             raise ValueError(f"Ingrédients introuvables : {ing_id_a}, {ing_id_b}")
 
+        fixed = self.get_combination("fixed_combination", ing_id_a, ing_id_b)
         combo_item = self.build_combination_item(
-            "de_facto_combination", item_a, item_b
+            "combination", item_a, item_b,
+            descendant_concept_ids=set(fixed.descendant_concept_ids) if fixed else None,
         )
         self.add_item(combo_item)
         return combo_item
@@ -257,10 +263,11 @@ class DrugCatalog:
         """Copie du catalogue sans les items d'un type donné (ex. purge des de facto)."""
         return DrugCatalog([item for item in self if item.kind != kind])
 
-    def register_de_facto_cohorts(self, cohorts_dir: str | Path) -> int:
-        """Détecte et enregistre dans le catalogue les bi-thérapies de facto
+    def register_combination_cohorts(self, cohorts_dir: str | Path) -> int:
+        """Détecte et enregistre dans le catalogue les bi-thérapies (kind combination)
 
         sauvegardées sur le disque (cohort_9*), en reconstituant leur vecteur u_a.
+        Les codes du comprimé combiné éventuel sont rattachés à l'item fusionné.
         Les paires dont un ingrédient est absent du catalogue sont ignorées.
         """
         cohorts_path = Path(cohorts_dir)
@@ -279,7 +286,7 @@ class DrugCatalog:
 
             if combo_id in self._items:
                 continue
-            if meta.get("kind") != "de_facto_combination" or len(ing_ids) != 2:
+            if meta.get("kind") != "combination" or len(ing_ids) != 2:
                 continue
 
             item_a = self.get(ing_ids[0])
@@ -288,8 +295,12 @@ class DrugCatalog:
                 n_skipped += 1
                 continue
 
+            fixed = self.get_combination("fixed_combination", *ing_ids)
             combo_item = self.build_combination_item(
-                "de_facto_combination", item_a, item_b, name=meta.get("name")
+                "combination", item_a, item_b, name=meta.get("name"),
+                descendant_concept_ids=(
+                    set(fixed.descendant_concept_ids) if fixed else None
+                ),
             )
             if combo_item.drug_id != combo_id:
                 print(
@@ -304,7 +315,7 @@ class DrugCatalog:
 
         if n_loaded or n_skipped:
             print(
-                f"-> {n_loaded:,} bi-thérapies de facto rattachées au"
+                f"-> {n_loaded:,} bi-thérapies rattachées au"
                 f" DrugCatalog ({n_skipped} ignorées)."
             )
         return n_loaded

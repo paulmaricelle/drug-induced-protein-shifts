@@ -40,7 +40,7 @@ class DrugCohort:
         drug_id: int,
         name: str | None = None,
         kind: Literal[
-            "monotherapy", "fixed_combination", "de_facto_combination"
+            "monotherapy", "fixed_combination", "combination"
         ] = "monotherapy",
         ingredient_concept_ids: list[int] | None = None,
         stanford_index: pl.DataFrame | None = None,

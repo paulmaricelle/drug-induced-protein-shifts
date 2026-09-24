@@ -1,7 +1,7 @@
 # src/pairs/pair.py
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 import polars as pl
 
@@ -24,11 +24,9 @@ class CandidatePair:
     by_kmeans: bool = False
     by_atc4: bool = False
 
-    # Recouvrement d'ingrédients (usage à décider pour l'entraînement)
-    # is_add_on : ingrédients de l'un strictement inclus dans l'autre (A+B vs A)
-    # same_ingredients : mêmes ingrédients sous deux formes (fixe vs de facto)
+    # Ingrédients de l'un strictement inclus dans l'autre (A+B vs A),
+    # usage à décider pour l'entraînement
     is_add_on: bool = False
-    same_ingredients: bool = False
 
     # Métriques quantitatives associées
     prevalence_a: float | None = None
@@ -84,7 +82,6 @@ class PairRegistry:
         "by_kmeans": pl.Boolean,
         "by_atc4": pl.Boolean,
         "is_add_on": pl.Boolean,
-        "same_ingredients": pl.Boolean,
         "prevalence_a": pl.Float64,
         "prevalence_b": pl.Float64,
         "css_score": pl.Float64,
@@ -126,7 +123,6 @@ class PairRegistry:
                 continue
             ings_a = set(item_a.ingredient_concept_ids) or {item_a.drug_id}
             ings_b = set(item_b.ingredient_concept_ids) or {item_b.drug_id}
-            p.same_ingredients = ings_a == ings_b
             p.is_add_on = ings_a < ings_b or ings_b < ings_a
 
     def to_dataframe(self) -> pl.DataFrame:
@@ -148,6 +144,9 @@ class PairRegistry:
         if not path.exists():
             return cls()
         df = pl.read_parquet(path)
+        # Tolère les colonnes de versions antérieures du registre
+        known = {f.name for f in fields(CandidatePair)}
+        df = df.select([c for c in df.columns if c in known])
         pairs = [CandidatePair(**row) for row in df.iter_rows(named=True)]
         return cls(pairs)
 

@@ -89,8 +89,8 @@ def main():
     paths = PathConfig(is_sample=False)
     catalog = DrugCatalog.load(paths.catalog_path)
 
-    # Rattacher automatiquement les bi-thérapies de facto
-    catalog.register_de_facto_cohorts(paths.output_cohorts_dir)
+    # Rattacher automatiquement les bi-thérapies (cohortes fusionnées cohort_9*)
+    catalog.register_combination_cohorts(paths.output_cohorts_dir)
 
     pairs_file = paths.root_dir / "data" / "candidate_pairs.parquet"
     registry = PairRegistry.load_parquet(pairs_file)
@@ -135,14 +135,9 @@ def main():
                 f" {p_both:,}"
             )
             p_addon = df.filter(pl.col("is_add_on")).height
-            p_same = df.filter(pl.col("same_ingredients")).height
             print(
                 f" - Paires add-on (A+B vs A)                  :"
                 f" {p_addon:,}"
-            )
-            print(
-                f" - Paires mêmes ingrédients (fixe/de facto)  :"
-                f" {p_same:,}"
             )
             print("\nExemples de paires candidates :")
             cols = [

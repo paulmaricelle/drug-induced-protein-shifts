@@ -1,5 +1,6 @@
 # scripts/extract_cohorts.py
 import argparse
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -42,8 +43,9 @@ def run_batch_extraction(
   catalog = DrugCatalog.load(paths.catalog_path)
   extractor = CohortExtractor(catalog=catalog, paths=paths, protocol=protocol)
 
-  # 2. Cibles : monothérapies puis bi-thérapies fixes
-  # (les de facto sont dérivées des passes monothérapie, cf. étape 5)
+  # 2. Cibles : monothérapies puis comprimés combinés (fixed_combination)
+  # Les passes fixes ne sont pas sauvegardées : elles sont fusionnées avec les
+  # co-initiations de facto en une cohorte unique par couple (cf. étape 5)
   monotherapy_ids = [i.drug_id for i in catalog if i.kind == "monotherapy"]
   fixed_ids = [i.drug_id for i in catalog if i.kind == "fixed_combination"]
 
@@ -72,8 +74,12 @@ def run_batch_extraction(
           " existantes ignorées."
       )
 
-  queue_ids = [cid for cid in target_ids if cid not in already_extracted_ids]
+  # Les comprimés combinés n'ont pas de dossier propre : toujours réextraits
   fixed_set = set(fixed_ids)
+  queue_ids = [
+      cid for cid in target_ids
+      if cid in fixed_set or cid not in already_extracted_ids
+  ]
   n_fixed_queued = sum(1 for cid in queue_ids if cid in fixed_set)
   print(
       f"Cohortes à traiter : {len(queue_ids) - n_fixed_queued:,} monothérapies"
@@ -81,8 +87,8 @@ def run_batch_extraction(
   )
   if resume and already_extracted_ids:
     print(
-        "[Avertissement] Reprise : les bi-thérapies de facto ne sont collectées"
-        " que depuis les monothérapies traitées dans cette exécution.\n"
+        "[Avertissement] Reprise : la partie de facto des bi-thérapies n'est"
+        " collectée que depuis les monothérapies traitées dans cette exécution.\n"
     )
 
   manifest_records = []
@@ -99,6 +105,10 @@ def run_batch_extraction(
       t0_extract = time.time()
       cohort = extractor.extract_cohort(cid)
       elapsed = time.time() - t0_extract
+
+      # Passe fixe : conservée en mémoire par l'extracteur pour la fusion
+      if item.kind == "fixed_combination":
+        continue
 
       if cohort is not None and cohort.n_stanford > 0:
         cohort.save(paths.output_cohorts_dir)
@@ -124,41 +134,64 @@ def run_batch_extraction(
       errors.append({"drug_id": cid, "error": str(e)})
       pbar.write(f"[ERREUR] ID {cid} ({item.name}): {e}")
 
-  # 5. Extraction des bi-thérapies de facto
+  # 5. Bi-thérapies : fusion fixes + de facto (une cohorte par couple)
   print(
-      f"\n2. Détection et export des bi-thérapies de facto (seuil N >="
-      f" {protocol.min_de_facto_size})..."
+      f"\n2. Fusion et export des bi-thérapies (fixes + de facto, seuil de facto"
+      f" seul N >= {protocol.min_de_facto_size})..."
   )
-  de_facto_cohorts = extractor.export_valid_de_facto_cohorts(
+  combo_cohorts = extractor.export_combination_cohorts(
       min_size=protocol.min_de_facto_size
   )
-  for combo_cohort in de_facto_cohorts:
+  for combo_cohort in combo_cohorts:
     combo_cohort.save(paths.output_cohorts_dir)
-    n_12m = combo_cohort.stanford_index.filter(
-        pl.col("has_12m_followup")
-    ).height
-
+    idx = combo_cohort.stanford_index
     manifest_records.append({
         "drug_id": combo_cohort.drug_id,
         "drug_name": combo_cohort.name,
         "kind": combo_cohort.kind,
         "n_final_stanford": combo_cohort.n_stanford,
-        "n_with_12m_followup": n_12m,
+        "n_with_12m_followup": idx.filter(pl.col("has_12m_followup")).height,
+        "n_fixed": idx.filter(pl.col("combo_source") == "fixed").height,
+        "n_de_facto": idx.filter(pl.col("combo_source") == "de_facto").height,
         "extraction_time_s": 0.0,
         "status": "SAVED",
     })
+  n_with_fixed = sum(1 for r in manifest_records if r.get("n_fixed"))
+  print(
+      f"-> {len(combo_cohorts):,} bi-thérapies exportées (dont {n_with_fixed:,}"
+      " avec des patients sous comprimé combiné)."
+  )
+
+  # Reconstruction complète : purge des dossiers absents du nouveau manifeste
+  # (anciens cohort_8*, bi-thérapies passées sous le seuil, etc.)
+  if not resume and limit is None:
+    kept = {r["drug_id"] for r in manifest_records if r["status"] == "SAVED"}
+    stale = [
+        f for f in paths.output_cohorts_dir.glob("cohort_*")
+        if f.is_dir() and f.name.replace("cohort_", "").isdigit()
+        and int(f.name.replace("cohort_", "")) not in kept
+    ]
+    for f in stale:
+      shutil.rmtree(f)
+    print(f"-> {len(stale):,} dossiers de cohortes obsolètes supprimés.")
 
   total_time = time.time() - start_total
 
   # 6. Synthèse et export du manifeste
   if manifest_records:
-    new_manifest_df = pl.DataFrame(manifest_records)
+    new_manifest_df = pl.DataFrame(
+        manifest_records,
+        schema_overrides={"n_fixed": pl.Int64, "n_de_facto": pl.Int64},
+        infer_schema_length=None,
+    )
     manifest_path = paths.output_cohorts_dir / "manifest.parquet"
     csv_path = paths.output_cohorts_dir / "manifest.csv"
 
     if manifest_path.exists() and resume:
       existing = pl.read_parquet(manifest_path)
-      full_manifest = pl.concat([existing, new_manifest_df]).unique(
+      full_manifest = pl.concat(
+          [existing, new_manifest_df], how="diagonal_relaxed"
+      ).unique(
           subset=["drug_id"], keep="last"
       )
     else:
