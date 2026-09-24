@@ -3,11 +3,13 @@ from pathlib import Path
 import sys
 import time
 import duckdb
+import polars as pl
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from src.catalog.atc_overrides import load_atc4_override_names, load_atc4_overrides
 from src.config import PathConfig
 
 VOCAB_DIR = Path("/remote/shared/collab/omop-vocabularies/v20250227")
@@ -183,6 +185,38 @@ def build_atc4_mapping() -> None:
     """
 
     con.execute(query)
+
+    # Corrections manuelles prioritaires (src/catalog/atc4_overrides.csv)
+    overrides = load_atc4_overrides()
+    df = pl.read_parquet(OUT_PATH).with_columns(pl.lit("vote").alias("atc4_source"))
+    n_applied = 0
+    if overrides:
+        ov = pl.DataFrame(
+            [{"ingredient_id": k, "ov_code": c, "ov_name": n} for k, (c, n) in overrides.items()]
+        )
+        df = df.join(ov, on="ingredient_id", how="left")
+        n_applied = df.filter(
+            pl.col("ov_code").is_not_null() & (pl.col("ov_code") != pl.col("atc4_code"))
+        ).height
+        df = df.with_columns(
+            pl.coalesce("ov_code", "atc4_code").alias("atc4_code"),
+            pl.coalesce("ov_name", "atc4_name").alias("atc4_name"),
+            pl.when(pl.col("ov_code").is_not_null()).then(pl.lit("override"))
+            .otherwise(pl.col("atc4_source")).alias("atc4_source"),
+        ).drop("ov_code", "ov_name")
+        # Ingrédients sans aucun lien ATC dans le vocabulaire : ajoutés depuis la table
+        missing = ov.join(df.select("ingredient_id"), on="ingredient_id", how="anti")
+        if missing.height:
+            names = {int(k): n for k, n in load_atc4_override_names().items()}
+            df = pl.concat([df, missing.select(
+                "ingredient_id",
+                pl.col("ingredient_id").replace_strict(names, return_dtype=pl.Utf8).alias("ingredient_name"),
+                pl.col("ov_code").alias("atc4_code"),
+                pl.col("ov_name").alias("atc4_name"),
+                pl.lit("override").alias("atc4_source"),
+            )], how="diagonal_relaxed")
+            n_applied += missing.height
+    df.write_parquet(OUT_PATH)
     elapsed = time.time() - start_time
 
     n_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{OUT_PATH}')").fetchone()[0]
@@ -196,6 +230,7 @@ def build_atc4_mapping() -> None:
                COUNT(*) FILTER (WHERE n_atc4_candidates > 1 AND atc4_n_expo > 0)
         FROM read_parquet('{OUT_PATH}')""").fetchone()
     print(f"  * Ingrédients à plusieurs ATC4 candidats  : {n_amb:,} (dont {n_voted:,} départagés par vote)")
+    print(f"  * Corrections manuelles appliquées        : {n_applied} (table : {len(overrides)})")
     print("=" * 80)
 
 

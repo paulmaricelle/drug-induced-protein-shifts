@@ -23,7 +23,7 @@ Pipeline, in dependency order:
 ```bash
 # 0. Vocabulary mappings (from /remote/shared/collab/omop-vocabularies/v20250227)
 python scripts/build_mapping.py            # -> data/ingredient_to_prescriptions.parquet
-python scripts/build_atc_mapping.py        # -> data/ingredient_to_atc4.parquet
+python scripts/build_atc_mapping.py        # -> data/ingredient_to_atc4.parquet (vote majoritaire STARR si le cache existe + corrections src/catalog/atc4_overrides.csv)
 
 # 1. Drug catalog: each flag is one stage and they are run in this order
 python scripts/build_catalog.py --fetch-fastas | --embed-esm2 | --embed-reactome | --embed-string \
@@ -85,6 +85,7 @@ To exercise a single drug, run `scripts/extract_cohorts.py --limit N`, run `audi
 - `utils/` is **legacy**: it imports `src.cohort_extractor`, which no longer exists. The maintained equivalents are in `scripts/` and `src/`. `utils/extract_motor_representations.py` (MOTOR/FEMR GPU extraction) has not been ported yet.
 - `extract_cohorts.py` in resume mode skips drugs whose folders already exist, so de facto rows are only collected from drugs processed in that run. Use `--no-resume` for a complete set. A full `--no-resume` run (no `--limit`) deletes cohort folders absent from the new manifest.
 - `CohortExtractor` checks the cache schema on load. A "Cache obsolète" error means the cache was built by an older `build_cache.py` and must be regenerated.
+- ATC4 choice: `build_atc_mapping.py` weights each candidate ATC4 by STARR exposures to the mono-ingredient forms linked to it, so it needs the cache. `src/catalog/atc4_overrides.csv` holds manual corrections (versioned, with a justification per row). They override the vote both in the mapping and in `DrugCatalog.from_pipeline_artifacts`. Add rows there rather than patching generated files.
 - `codebase.txt` is a concatenated snapshot of the source files and may be out of date. Edit the real files, not this snapshot.
 - `PairRegistry` merges into the existing `data/candidate_pairs.parquet`. Delete that file before regenerating pairs after a re-extraction, or pairs with stale IDs will survive.
 - `data/` and all parquet/npy/pt artifacts are gitignored (clinical data). Never commit them.

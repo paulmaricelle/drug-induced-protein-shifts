@@ -1,0 +1,58 @@
+ingredient_id,ingredient_name,atc4_code,atc4_name,justification
+1118084,celecoxib,M01AH,Coxibs,Anti-inflammatoire (coxib) ; L01XX45 ne concerne que l'indication PAF
+937791,bismuth subsalicylate,A07BB,Bismuth preparations,Antidiarrhéique oral ; C05AX (hémorroïdes) incorrect
+19049410,chloroprocaine,N01BA,Esters of aminobenzoic acid,Anesthésique local ester (rachianesthésie/péridurale) ; S01HA marginal
+40244266,aflibercept,S01LA,Antineovascularisation agents,"Voie intravitréenne majoritaire, IV quasi nulle dans STARR"
+1001419,cocaine,N01BC,Esters of benzoic acid,Anesthésique local topique (ORL)
+1129625,diphenhydramine,R06AA,Aminoalkyl ethers,Antihistaminique systémique ; N04AB = usage antiparkinsonien marginal
+19011440,everolimus,L04AH,Mammalian target of rapamycin (mTOR) kinase inhibitors,"Doses de transplantation (0,25-1 mg) majoritaires dans STARR"
+996416,finasteride,G04CB,Testosterone-5-alpha reductase inhibitors,Dose 5 mg (HBP) = 82 % des expositions STARR
+996541,fluocinolone,D07AC,"Corticosteroids, potent (group III)",Corticoïde dermique ; C05AA retenu par égalité alphabétique
+955252,fluocinonide,D07AC,"Corticosteroids, potent (group III)",Corticoïde dermique puissant ; C05AA retenu par égalité alphabétique
+1502905,insulin glargine,A10AE,"Insulins and analogues for injection, long-acting",Insuline d'action prolongée (A10AE04)
+46221581,insulin isophane,A10AC,"Insulins and analogues for injection, intermediate-acting",Insuline NPH d'action intermédiaire (A10AC)
+989878,lidocaine,D04AB,Anesthetics for topical use,Voies topique/transdermique majoritaires ; C05AD (hémorroïdes) retenu par égalité
+1551099,prednisone,H02AB,Glucocorticoids,Glucocorticoïde systémique ; A07EA incorrect
+1114220,naloxone,V03AB,Antidotes,Antidote des opioïdes ; A06AH = associations orales
+1135766,phenylephrine,C01CA,Adrenergic and dopaminergic agents,Voie IV = 50 % des expositions (vasopresseur péri-opératoire)
+1300978,megestrol,L02AB,Progestogens,Usage oncologique/orexigène ; G03AC contraceptif non utilisé
+37002370,oxybate,N07XX,Other nervous system drugs,Oxybate de sodium (narcolepsie) ; N01AX hors usage américain
+19034726,sirolimus,L04AH,Mammalian target of rapamycin (mTOR) kinase inhibitors,Immunosuppresseur de transplantation (L04AH01)
+779984,vonoprazan,A02BC,Proton pump inhibitors,Inhibiteur de la sécrétion acide seul (A02BC08) ; A02BD = kits d'éradication
+965748,scopolamine,A04AD,Other antiemetics,Patch transdermique antiémétique dominant (sans lien ATC dans le vocabulaire)
+1174888,hydrocodone,N02AA,Natural opium alkaloids,Monothérapie = opioïde analgésique à libération prolongée
+40244464,ruxolitinib,L01EJ,Janus-associated kinase (JAK) inhibitors,Voie orale = 63 % des expositions (Jakafi)
+914335,atropine,A03BA,"Belladonna alkaloids, tertiary amines",Voies systémiques (IV/SC) majoritaires devant la voie oculaire
+939881,capsaicin,M02AB,Capsaicin and similar agents,Voie topique = 71 % des expositions
+978236,eflornithine,D11AX,Other dermatologicals,Crème topique majoritaire (Vaniqa)
+1192218,levalbuterol,R03AC,Selective beta-2-adrenoreceptor agonists,Absent du vocabulaire ATC : classe pharmacologique (énantiomère de l'albutérol)
+42709324,vitamin D3,A11CC,Vitamin D and analogues,Absent du vocabulaire ATC : classe pharmacologique
+35605594,fosaprepitant,A04AD,Other antiemetics,Absent du vocabulaire ATC : classe pharmacologique (prodrogue de l'aprépitant)
+967562,loteprednol etabonate,S01BA,"Corticosteroids, plain",Absent du vocabulaire ATC : classe pharmacologique (collyre corticoïde)
+963950,tezacaftor,R07AX,Other respiratory system products,Absent du vocabulaire ATC : classe pharmacologique (modulateur CFTR)
+37497446,elexacaftor,R07AX,Other respiratory system products,Absent du vocabulaire ATC : classe pharmacologique (modulateur CFTR)
+1111220,arformoterol,R03AC,Selective beta-2-adrenoreceptor agonists,Absent du vocabulaire ATC : classe pharmacologique (énantiomère du formotérol)
+740560,carbidopa,N04BA,Dopa and dopa derivatives,Absent du vocabulaire ATC : classe pharmacologique (inhibiteur de la dopa-décarboxylase)
+702498,tezepelumab,R03DX,Other systemic drugs for obstructive airway diseases,"Absent du vocabulaire ATC : classe pharmacologique (anti-TSLP, asthme)"
+1758562,inclisiran,C10AX,Other lipid modifying agents,Absent du vocabulaire ATC : classe pharmacologique (siARN PCSK9)
+1189766,levorphanol,N02AF,Morphinan derivatives,Absent du vocabulaire ATC : classe pharmacologique (dérivé morphinane)
+723344,phendimetrazine,A08AA,Centrally acting antiobesity products,Absent du vocabulaire ATC : classe pharmacologique (anorexigène central)
+40166571,bepotastine,S01GX,Other antiallergics,Absent du vocabulaire ATC : classe pharmacologique (collyre antiallergique)
+35602825,aripiprazole lauroxil,N05AX,Other antipsychotics,Absent du vocabulaire ATC : classe pharmacologique (forme retard de l'aripiprazole)
+1592541,telotristat ethyl,A16AX,Various alimentary tract and metabolism products,Absent du vocabulaire ATC : classe pharmacologique
+1525278,estropipate,G03CA,"Natural and semisynthetic estrogens, plain",Absent du vocabulaire ATC : classe pharmacologique (œstrogène conjugué)
+746895,bimekizumab,L04AC,Interleukin inhibitors,Absent du vocabulaire ATC : classe pharmacologique (anti-IL-17)
+1758687,tralokinumab,D11AH,"Agents for dermatitis, excluding corticosteroids","Absent du vocabulaire ATC : classe pharmacologique (anti-IL-13, dermatite atopique)"
+702133,asciminib,L01EA,BCR-ABL tyrosine kinase inhibitors,Absent du vocabulaire ATC : classe pharmacologique (inhibiteur BCR-ABL)
+746225,quizartinib,L01EX,Other protein kinase inhibitors,Absent du vocabulaire ATC : classe pharmacologique (inhibiteur FLT3)
+1200957,zavegepant,N02CD,Calcitonin gene-related peptide (CGRP) antagonists,Absent du vocabulaire ATC : classe pharmacologique (antagoniste CGRP)
+747362,repotrectinib,L01EX,Other protein kinase inhibitors,Absent du vocabulaire ATC : classe pharmacologique (inhibiteur ROS1/TRK)
+747349,nirogacestat,L01XX,Other antineoplastic agents,Absent du vocabulaire ATC : classe pharmacologique (inhibiteur gamma-sécrétase)
+702318,vosoritide,M05BX,Other drugs affecting bone structure and mineralization,Absent du vocabulaire ATC : classe pharmacologique
+1735491,inavolisib,L01EM,Phosphatidylinositol-3-kinase (Pi3K) inhibitors,Absent du vocabulaire ATC : classe pharmacologique (inhibiteur PI3K)
+747180,zuranolone,N06AX,Other antidepressants,Absent du vocabulaire ATC : classe pharmacologique
+42609512,sotatercept,C02KX,Antihypertensives for pulmonary arterial hypertension,Absent du vocabulaire ATC : classe pharmacologique (HTAP)
+742050,olutasidenib,L01XM,Isocitrate dehydrogenase (IDH) inhibitors,Absent du vocabulaire ATC : classe pharmacologique (inhibiteur IDH1)
+1758974,abrocitinib,D11AH,"Agents for dermatitis, excluding corticosteroids","Absent du vocabulaire ATC : classe pharmacologique (JAK1, dermatite atopique)"
+45776421,efmoroctocog alfa,B02BD,Blood coagulation factors,Absent du vocabulaire ATC : classe pharmacologique (facteur VIII)
+1718111,vonicog alfa,B02BD,Blood coagulation factors,Absent du vocabulaire ATC : classe pharmacologique (facteur de von Willebrand)

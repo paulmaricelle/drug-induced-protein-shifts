@@ -9,6 +9,8 @@ from typing import Any, Literal
 import numpy as np
 import polars as pl
 
+from src.catalog.atc_overrides import load_atc4_overrides
+
 # Préfixes des IDs synthétiques (13 chiffres, sans collision avec les concept_id OMOP)
 # - fixed_combination (8…) : recette d'extraction du comprimé combiné, sans cohorte propre
 # - combination (9…, dossiers cohort_9*) : cohorte unique par couple d'ingrédients,
@@ -351,6 +353,11 @@ class DrugCatalog:
             print(f"  -> {len(atc_dict):,} ingrédients associés à une classe ATC4.")
         else:
             print(f"[Avertissement] Fichier ATC4 introuvable ({atc_file}). Wash-out comparateurs désactivé.")
+
+        # Corrections manuelles prioritaires, même si le mapping ATC4 est plus ancien
+        overrides = load_atc4_overrides()
+        atc_dict.update(overrides)
+        print(f"  -> {len(overrides)} corrections ATC4 manuelles appliquées.")
 
         # 2. Instanciation des monothérapies
         for row in df_cat.iter_rows(named=True):
