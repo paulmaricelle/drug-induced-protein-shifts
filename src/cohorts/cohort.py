@@ -80,7 +80,10 @@ class DrugCohort:
         # ---------------------------------------------------------------------
         # 3. Prototypes cliniques
         # ---------------------------------------------------------------------
-        self._prototypes: np.ndarray | None = None  # (k, 768)
+        # Centroïdes k-means dans l'espace blanchi (k, d) et poids associés
+        # (fraction de la cohorte par cluster), cf. src/pairs/motor_pairs.py
+        self._prototypes: np.ndarray | None = None  # (k, d)
+        self._prototype_weights: np.ndarray | None = None  # (k,)
 
     # -------------------------------------------------------------------------
     # Constructeur d'usine
@@ -310,11 +313,23 @@ class DrugCohort:
     # Alignement des données de la sous-cohorte Stanford
     # -------------------------------------------------------------------------
     def load_stanford_motor_z0(
-        self, parquet_path: str | Path, id_cols: list[str] | None = None
+        self,
+        source: str | Path | pl.DataFrame,
+        id_cols: list[str] | None = None,
     ) -> np.ndarray:
         """Charge et aligne strictement la matrice MOTOR z0 (N, 768) sur stanford_index
 
-        en utilisant la clé composite (person_id, t0).
+        en utilisant la clé composite (person_id, t0) (Section 4.1).
+
+        `source` : DataFrame, fichier parquet, ou dossier du magasin central
+        produit par scripts/extract_motor_representations.py (fragments
+        chunk_*.parquet). Deux formats de colonnes sont acceptés : une colonne
+        `z` de type Array(Float32, 768) (magasin) ou des colonnes data_0..data_767
+        (ancien format CSV/parquet RABIT).
+
+        L'ordre et le nombre de lignes de stanford_index sont conservés : une
+        inclusion sans représentation reçoit une ligne NaN (jamais de décalage
+        silencieux entre z0 et l'index).
         """
         if self.stanford_index is None:
             raise ValueError(
@@ -322,30 +337,59 @@ class DrugCohort:
             )
 
         keys = id_cols or ["person_id", "t0"]
-        df_reps = pl.read_parquet(parquet_path)
-        feature_cols = [
-            c
-            for c in df_reps.columns
-            if c.startswith("data_") or c.startswith("emb_")
-        ]
-        if not feature_cols:
-            feature_cols = [f"data_{i}" for i in range(768)]
+        if isinstance(source, pl.DataFrame):
+            df_reps = source
+        else:
+            path = Path(source)
+            if path.is_dir():
+                shards = sorted(path.glob("chunk_*.parquet"))
+                if not shards:
+                    raise FileNotFoundError(f"Aucun fragment chunk_*.parquet dans {path}")
+                df_reps = pl.concat([pl.read_parquet(f) for f in shards])
+            else:
+                df_reps = pl.read_parquet(path)
 
-        aligned = self.stanford_index.select(keys).join(
-            df_reps.select(keys + feature_cols),
-            on=keys,
-            how="inner",
-        )
+        index_keys = self.stanford_index.select(
+            pl.col(keys[0]).cast(pl.Int64), *[pl.col(k) for k in keys[1:]]
+        ).with_row_index("_row")
+        df_reps = df_reps.with_columns(pl.col(keys[0]).cast(pl.Int64))
 
-        if len(aligned) != len(self.stanford_index):
+        if "z" in df_reps.columns:
+            matched = index_keys.join(
+                df_reps.select(keys + ["z"]).unique(subset=keys, keep="first"),
+                on=keys,
+                how="inner",
+            )
+            values = matched["z"].to_numpy().astype(np.float32)
+        else:
+            feature_cols = [
+                c
+                for c in df_reps.columns
+                if c.startswith("data_") or c.startswith("emb_")
+            ]
+            if not feature_cols:
+                raise ValueError("Aucune colonne de représentation (z, data_*, emb_*).")
+            matched = index_keys.join(
+                df_reps.select(keys + feature_cols).unique(subset=keys, keep="first"),
+                on=keys,
+                how="inner",
+            )
+            values = matched.select(feature_cols).to_numpy().astype(np.float32)
+
+        n = len(self.stanford_index)
+        z0 = np.full((n, values.shape[1] if values.ndim == 2 and len(values) else 768),
+                     np.nan, dtype=np.float32)
+        if len(matched):
+            z0[matched["_row"].to_numpy()] = values
+
+        if len(matched) != n:
             print(
                 f"[Avertissement] Cohorte {self.drug_id} (Stanford) : "
-                f"{len(aligned)}/{len(self.stanford_index)} patients disposent d'un embedding MOTOR z0."
+                f"{len(matched)}/{n} inclusions disposent d'un embedding MOTOR z0 "
+                f"(lignes manquantes = NaN)."
             )
 
-        self._stanford_motor_z0 = (
-            aligned.select(feature_cols).to_numpy().astype(np.float32)
-        )
+        self._stanford_motor_z0 = z0
         return self._stanford_motor_z0
 
     def load_stanford_rabit_deltas(
@@ -424,78 +468,86 @@ class DrugCohort:
     # -------------------------------------------------------------------------
     def compute_prototypes(
         self,
-        k: int = 3,
+        k: int | Literal["auto", "bic"] = 3,
         source: Literal["stanford", "ukb"] = "stanford",
         whitener: MotorWhitener | None = None,
         force_recompute: bool = False,
         random_state: int = 42,
+        k_max: int = 5,
+        min_cluster_patients: int = 50,
+        max_fit_samples: int = 20000,
     ) -> np.ndarray:
-      """Calcule ou charge k prototypes cliniques L2-normalisés dans l'espace MOTOR (768-d).
+        """Calcule (ou renvoie, si déjà calculés) les prototypes k-means de la
+        cohorte dans l'espace MOTOR blanchi (Section 4.2, Méthode 3).
 
-      Si un whitener est fourni, le clustering k-means est entraîné sur les
-      représentations blanchies (Section 4.2 du protocole).
-      """
-      reps = (
-          self._stanford_motor_z0
-          if source == "stanford"
-          else self._ukb_motor_z0
-      )
-      if reps is None:
-        raise ValueError(
-            f"Représentations MOTOR z0 non chargées pour la source '{source}'."
-        )
-
-      n_samples = reps.shape[0]
-      if n_samples == 0:
-        raise ValueError(
-            f"Cohorte {self.drug_id} ({self.name}) vide : impossible de"
-            " calculer des prototypes."
-        )
-
-      # 1. Blanchiment conditionnel pour le clustering k-means
-      cluster_input = reps if whitener is None else whitener.transform(reps)
-
-      # 2. K-Means adaptatif
-      if n_samples <= k:
-        raw_prototypes = cluster_input.copy()
-      else:
-        kmeans = KMeans(
-            n_clusters=k,
-            random_state=random_state,
-            n_init="auto",
-        )
-        kmeans.fit(cluster_input)
-        raw_prototypes = kmeans.cluster_centers_.astype(np.float32)
-
-      # 3. Normalisation L2 stricte pour la distance cosinus min-linkage
-      norms = np.linalg.norm(raw_prototypes, axis=1, keepdims=True)
-      self._prototypes = raw_prototypes / np.maximum(norms, 1e-8)
-
-      return self._prototypes
-
-    # -------------------------------------------------------------------------
-    # Distance Inter-Cohortes (Min-Linkage Cosinus)
-    # -------------------------------------------------------------------------
-    def min_cosine_distance(self, other: DrugCohort) -> float:
-        """Calcule la métrique de chevauchement clinique :
-
-            d_min(A, B) = min_{i,j} (1 - cos(mu_{A,i}, mu_{B,j})).
-
-        Retourne un scalaire dans [0.0, 2.0]. Une valeur proche de 0 indique qu'au
-        moins un sous-groupe clinique est partagé entre les deux molécules (indication commune).
+        Enveloppe de `src.pairs.motor_pairs.fit_cohort_prototypes` pour une
+        cohorte isolée ; le traitement de toutes les cohortes passe par
+        `scripts/build_motor_pairs.py`. Les lignes NaN (inclusions sans
+        représentation) sont écartées. Les centroïdes ne sont plus normalisés
+        L2 : la métrique est choisie au moment du calcul des distances.
+        Le `whitener` doit être le même pour toutes les cohortes comparées.
         """
-        if self._prototypes is None:
-            raise ValueError(
-                f"Prototypes non calculés pour {self.drug_id} ({self.name})."
-            )
-        if other._prototypes is None:
-            raise ValueError(
-                f"Prototypes non calculés pour {other.drug_id} ({other.name})."
-            )
+        from src.pairs.motor_pairs import fit_cohort_prototypes
 
-        sim_matrix = np.dot(self._prototypes, other._prototypes.T)
-        max_sim = float(np.max(sim_matrix))
+        if self._prototypes is not None and not force_recompute:
+            return self._prototypes
+        reps = (
+            self._stanford_motor_z0
+            if source == "stanford"
+            else self._ukb_motor_z0
+        )
+        if reps is None:
+            raise ValueError(
+                f"Représentations MOTOR z0 non chargées pour la source '{source}'."
+            )
+        reps = reps[np.isfinite(reps).all(axis=1)]
+        Z = whitener.transform(reps) if whitener is not None else reps
+        protos = fit_cohort_prototypes(
+            Z,
+            self.drug_id,
+            k=k,
+            k_max=k_max,
+            min_cluster_patients=min_cluster_patients,
+            max_fit_samples=max_fit_samples,
+            seed=random_state,
+        )
+        self._prototypes = protos.centroids
+        self._prototype_weights = protos.weights
+        return self._prototypes
 
+    # -------------------------------------------------------------------------
+    # Distance Inter-Cohortes (Min-Linkage)
+    # -------------------------------------------------------------------------
+    def min_cosine_distance(
+        self, other: DrugCohort, min_cluster_weight: float = 0.0
+    ) -> float:
+        """Distance min-linkage cosinus entre prototypes (Section 4.2) :
+
+            d_min(A, B) = min_{i,j éligibles} (1 - cos(mu_{A,i}, mu_{B,j})),
+
+        dans [0, 2]. Un cluster est éligible si son poids >= min_cluster_weight
+        (le cluster majoritaire l'est toujours). Pour le criblage de toutes les
+        paires, préférer `src.pairs.motor_pairs.cluster_distances` (vectorisé,
+        métrique de Mahalanobis débiaisée par défaut).
+        """
+        for c in (self, other):
+            if c._prototypes is None:
+                raise ValueError(
+                    f"Prototypes non calculés pour {c.drug_id} ({c.name})."
+                )
+
+        def _eligible(c: DrugCohort) -> np.ndarray:
+            P = c._prototypes / np.maximum(
+                np.linalg.norm(c._prototypes, axis=1, keepdims=True), 1e-12
+            )
+            w = c._prototype_weights
+            if w is None or min_cluster_weight <= 0:
+                return P
+            keep = w >= min_cluster_weight
+            keep[np.argmax(w)] = True
+            return P[keep]
+
+        max_sim = float(np.max(_eligible(self) @ _eligible(other).T))
         return float(np.clip(1.0 - max_sim, 0.0, 2.0))
 
     # -------------------------------------------------------------------------
@@ -505,12 +557,18 @@ class DrugCohort:
         self,
         source: Literal["stanford", "ukb"] = "stanford",
         timepoint: Literal["baseline_t0", "followup_6m", "followup_12m"] = "baseline_t0",
+        anchor: str = "day_start",
     ) -> pl.DataFrame:
         """Génère les points d'inférence temporels requis par le moteur FEMR / MOTOR :
 
-        (patient_id, prediction_time) avec granularité à la minute.
+        (patient_id, prediction_time) avec granularité à la minute. Plusieurs
+        instants par patient sont possibles (femr_compute_representations les
+        accepte ; seul rabit_pipeline.py impose un patient par fichier).
 
-        - 'baseline_t0' : date index t0 (sur l'historique sans les prescriptions de t0).
+        - 'baseline_t0' : date index t0, décalée selon `anchor` (voir
+          src/cohorts/motor.py). Défaut 'day_start' = t0 00:00 : historique
+          jusqu'à la fin de la veille, AUCUN événement du jour t0 (repli du
+          protocole Section 4.1 : les diagnostics de t0 sont aussi exclus).
         - 'followup_6m' : date t0 + 6 mois (après ablation de la molécule d'intérêt).
         - 'followup_12m': date t0 + 12 mois (après ablation de la molécule d'intérêt).
         """
@@ -538,11 +596,20 @@ class DrugCohort:
         else:
             raise ValueError(f"Source inconnue : {source}")
 
+        from src.cohorts.motor import ANCHOR_OFFSETS_MIN
+
+        if anchor not in ANCHOR_OFFSETS_MIN:
+            raise ValueError(f"Ancrage inconnu : {anchor}")
+        offset_min = ANCHOR_OFFSETS_MIN[anchor] if timepoint == "baseline_t0" else 0
+
         return (
             df.select(
                 [
                     pl.col(id_col).cast(pl.Int64).alias("patient_id"),
-                    pl.col(time_col)
+                    (
+                        pl.col(time_col).cast(pl.Datetime("us"))
+                        + pl.duration(minutes=offset_min)
+                    )
                     .dt.strftime("%Y-%m-%d %H:%M:00")
                     .alias("prediction_time"),
                 ]
@@ -563,52 +630,6 @@ class DrugCohort:
         )
 
 
-class MotorWhitener:
-  """Opérateur de blanchiment de Mahalanobis / ZCA pour l'espace MOTOR (Section 4.2).
-
-  Transforme z en z_tilde = (z - mu) @ W_whitening pour annuler les corrélations
-  croisées et normaliser les variances directionnelles sur la population de
-  référence.
-  """
-
-  def __init__(
-      self,
-      mean: np.ndarray,
-      whitening_matrix: np.ndarray,
-  ):
-    self.mean = mean.astype(np.float32)  # (768,)
-    self.W = whitening_matrix.astype(np.float32)  # (768, 768)
-
-  @classmethod
-  def fit_from_embeddings(
-      cls,
-      embeddings: np.ndarray,
-      eps: float = 1e-5,
-  ) -> MotorWhitener:
-    """Calibre l'opérateur de blanchiment ZCA sur un échantillon représentatif de MOTOR (N, 768)."""
-    mu = np.mean(embeddings, axis=0)
-    centered = embeddings - mu
-    n = centered.shape[0]
-
-    cov = (centered.T @ centered) / (n - 1)
-    # Décomposition spectrale : cov = U @ diag(S) @ U.T
-    evals, evecs = np.linalg.eigh(cov)
-
-    # Inversion régularisée des valeurs propres
-    inv_sqrt_evals = 1.0 / np.sqrt(np.maximum(evals, eps))
-    # Whitening ZCA : préserve l'orientation spatiale globale au plus proche de l'original
-    W = evecs @ np.diag(inv_sqrt_evals) @ evecs.T
-
-    return cls(mean=mu, whitening_matrix=W)
-
-  def transform(self, z: np.ndarray) -> np.ndarray:
-    """Applique le blanchiment : z_tilde = (z - mu) @ W."""
-    return (z - self.mean) @ self.W
-
-  def save(self, filepath: str | Path) -> None:
-    np.savez_compressed(filepath, mean=self.mean, W=self.W)
-
-  @classmethod
-  def load(cls, filepath: str | Path) -> MotorWhitener:
-    data = np.load(filepath)
-    return cls(mean=data["mean"], whitening_matrix=data["W"])
+# Le blanchiment de la Méthode 3 vit désormais dans src/pairs/motor_pairs.py ;
+# ré-export pour compatibilité (`from src.cohorts.cohort import MotorWhitener`).
+from src.pairs.motor_pairs import MotorWhitener  # noqa: E402,F401

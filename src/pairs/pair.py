@@ -34,6 +34,17 @@ class CandidatePair:
     css_score: float | None = None
     kmeans_min_dist: float | None = None
 
+    # Méthode 3 (k-means sur MOTOR z0 blanchi, src/pairs/motor_pairs.py) :
+    # clusters appariés par min-linkage et fraction de chaque cohorte dans ces
+    # clusters. Orientés comme (drug_id_a, drug_id_b) ; hors clé du registre.
+    kmeans_cluster_a: int | None = None
+    kmeans_cluster_b: int | None = None
+    kmeans_weight_a: float | None = None
+    kmeans_weight_b: float | None = None
+    # Fraction de la cohorte dans les clusters proches (<= seuil) de l'autre
+    kmeans_shared_weight_a: float | None = None
+    kmeans_shared_weight_b: float | None = None
+
     # Métadonnées descriptives
     drug_name_a: str = ""
     drug_name_b: str = ""
@@ -86,6 +97,12 @@ class PairRegistry:
         "prevalence_b": pl.Float64,
         "css_score": pl.Float64,
         "kmeans_min_dist": pl.Float64,
+        "kmeans_cluster_a": pl.Int64,
+        "kmeans_cluster_b": pl.Int64,
+        "kmeans_weight_a": pl.Float64,
+        "kmeans_weight_b": pl.Float64,
+        "kmeans_shared_weight_a": pl.Float64,
+        "kmeans_shared_weight_b": pl.Float64,
         "drug_name_a": pl.Utf8,
         "drug_name_b": pl.Utf8,
         "n_patients_a": pl.Int64,
@@ -110,6 +127,17 @@ class PairRegistry:
                 existing.css_score = pair.css_score
             if pair.kmeans_min_dist is not None:
                 existing.kmeans_min_dist = pair.kmeans_min_dist
+                # Attributs orientés (a, b) : réalignés si les paires sont
+                # enregistrées dans des sens opposés
+                same = existing.drug_id_a == pair.drug_id_a
+                for side, other in (("a", "b"), ("b", "a")):
+                    src = side if same else other
+                    for attr in ("cluster", "weight", "shared_weight"):
+                        setattr(
+                            existing,
+                            f"kmeans_{attr}_{side}",
+                            getattr(pair, f"kmeans_{attr}_{src}"),
+                        )
             if pair.stratum_name and not existing.stratum_name:
                 existing.stratum_name = pair.stratum_name
         else:
