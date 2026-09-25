@@ -168,23 +168,44 @@ class CohortExtractor:
     local_routes = ", ".join(str(r) for r in p.local_route_concept_ids) or "NULL"
     short_days = max(p.short_order_max_days, 0)
 
+    ext = p.persistence_extension
+    pers_lo, pers_hi = p.persistence_window_days
+
     if is_fixed:
       # Dispensations du comprimé combiné
       target_filter = (
           "drug_concept_id IN (SELECT drug_concept_id FROM target_codes)"
       )
       # Seuls les 2 ingrédients du comprimé sont de nouvelles initiations comptées
-      final_filter = "n_new = 2 AND n_new_targets = 2"
+      final_tpl = "n_new{s} = 2 AND n_new_targets{s} = 2"
     else:
       # Expositions à la molécule cible sous forme MONOTHÉRAPIE
       target_filter = f"ingredient_id = {target_id} AND is_monotherapy = TRUE"
       # 1 seule nouvelle initiation comptée (la cible), sous forme mono
-      final_filter = "n_new = 1 AND all_mono"
+      final_tpl = "n_new{s} = 1 AND all_mono{s}"
+    final_filter = final_tpl.format(s="")
+    final_filter_x = final_tpl.format(s="_x")
+
+    # Persistance d'une co-initiation : réexposition au même ingrédient dans la fenêtre
+    pers_cte = f"""
+        persistent AS (
+            SELECT DISTINCT n.person_id, n.d, n.ingredient_id
+            FROM new_ingredients n
+            JOIN drug_exposure de
+              ON de.person_id = n.person_id AND de.ingredient_id = n.ingredient_id
+             AND de.exp_date >= (n.d + INTERVAL '{pers_lo} days')
+             AND de.exp_date <= (n.d + INTERVAL '{pers_hi} days')
+        ),""" if ext else ""
+    pers_expr = "(p.ingredient_id IS NOT NULL)" if ext else "FALSE"
+    pers_join = """
+                LEFT JOIN persistent p
+                  ON p.person_id = n.person_id AND p.d = n.d
+                 AND p.ingredient_id = n.ingredient_id""" if ext else ""
 
     # Bi-thérapies de facto : collectées uniquement depuis les passes monothérapie
     de_facto_select = "" if is_fixed else f"""
         -- RECORD 2 : Co-initiations de facto (toutes dates éligibles, la fusion
-        -- retient la plus précoce commune aux deux passes)
+        -- retient la plus précoce commune aux deux passes, règle principale d'abord)
         UNION ALL
         SELECT
             2::TINYINT,
@@ -196,11 +217,15 @@ class CohortExtractor:
             (w.obs_end - c.d)::INTEGER,
             ((w.obs_end - c.d) >= {p.followup_12m_days})::BOOLEAN,
             c.ingredient_id AS other_ingredient_id,
-            NULL::BIGINT
+            NULL::BIGINT,
+            CASE WHEN pd.n_new = 2 AND pd.all_mono AND c.counted
+                 THEN 't0_info' ELSE 'persistence' END
         FROM counted c
         JOIN per_d pd ON pd.person_id = c.person_id AND pd.d = c.d
         JOIN wo_ok w ON w.person_id = c.person_id AND w.d = c.d
-        WHERE pd.n_new = 2 AND pd.all_mono AND c.counted AND NOT c.is_target"""
+        WHERE NOT c.is_target
+          AND ((pd.n_new = 2 AND pd.all_mono AND c.counted)
+               OR (pd.n_new_x = 2 AND pd.all_mono_x AND c.counted_x))"""
 
     return f"""
         WITH
@@ -275,37 +300,59 @@ class CohortExtractor:
                 BOOL_AND(COALESCE(route_concept_id IN ({local_routes}), FALSE)) AS is_local
             FROM new_rows
             GROUP BY 1, 2, 3
-        ),
+        ),{pers_cte}
         counted AS (
             SELECT n.*,
-                   (n.ingredient_id IN (SELECT ingredient_id FROM target_ingredients)) AS is_target,
-                   (n.ingredient_id IN (SELECT ingredient_id FROM target_ingredients))
-                     OR ({self._counted_expr()}) AS counted
+                   -- Extension : co-initiation comptée seulement si elle persiste
+                   n.counted AND (n.is_target OR n.is_persistent) AS counted_x
             FROM (
-                SELECT n.*, COALESCE(f.in_scope, FALSE) AS in_scope,
-                       COALESCE(f.procedural, FALSE) AS procedural
-                FROM new_ingredients n
-                LEFT JOIN ing_flags f ON f.ingredient_id = n.ingredient_id
+                SELECT n.*,
+                       (n.ingredient_id IN (SELECT ingredient_id FROM target_ingredients)) AS is_target,
+                       (n.ingredient_id IN (SELECT ingredient_id FROM target_ingredients))
+                         OR ({self._counted_expr()}) AS counted
+                FROM (
+                    SELECT n.*, COALESCE(f.in_scope, FALSE) AS in_scope,
+                           COALESCE(f.procedural, FALSE) AS procedural,
+                           {pers_expr} AS is_persistent
+                    FROM new_ingredients n
+                    LEFT JOIN ing_flags f ON f.ingredient_id = n.ingredient_id{pers_join}
+                ) n
             ) n
         ),
         per_d AS (
             SELECT person_id, d,
                 COUNT(*) FILTER (WHERE counted)::INTEGER AS n_new,
                 COUNT(*) FILTER (WHERE counted AND is_target)::INTEGER AS n_new_targets,
-                COALESCE(BOOL_AND(all_mono) FILTER (WHERE counted), TRUE) AS all_mono
+                COALESCE(BOOL_AND(all_mono) FILTER (WHERE counted), TRUE) AS all_mono,
+                COUNT(*) FILTER (WHERE counted_x)::INTEGER AS n_new_x,
+                COUNT(*) FILTER (WHERE counted_x AND is_target)::INTEGER AS n_new_targets_x,
+                COALESCE(BOOL_AND(all_mono) FILTER (WHERE counted_x), TRUE) AS all_mono_x
             FROM counted
             GROUP BY 1, 2
         ),
 
-        -- 5. t0 = première date éligible
-        t0_sel AS (
+        -- 5. t0 = première date éligible selon les règles connues à t0 ('t0_info') ;
+        -- à défaut, première date éligible selon l'extension persistance
+        t0_main AS (
             SELECT person_id, MIN(d) AS t0
             FROM per_d
             WHERE {final_filter}
             GROUP BY 1
         ),
+        t0_ext AS (
+            SELECT person_id, MIN(d) AS t0
+            FROM per_d
+            WHERE {"TRUE" if ext else "FALSE"} AND {final_filter_x}
+              AND person_id NOT IN (SELECT person_id FROM t0_main)
+            GROUP BY 1
+        ),
+        t0_sel AS (
+            SELECT person_id, t0, 't0_info' AS t0_rule FROM t0_main
+            UNION ALL
+            SELECT person_id, t0, 'persistence' AS t0_rule FROM t0_ext
+        ),
         step_final AS (
-            SELECT t.person_id, t.t0,
+            SELECT t.person_id, t.t0, t.t0_rule,
                 (t.t0 + INTERVAL '{p.obs_post_days} days')::DATE AS t_6m,
                 (t.t0 + INTERVAL '{p.followup_12m_days} days')::DATE AS t_12m,
                 (t.t0 - w.obs_start)::INTEGER AS history_days_prior,
@@ -326,18 +373,19 @@ class CohortExtractor:
             follow_up_days,
             has_12m_followup,
             NULL::BIGINT AS other_ingredient_id,
-            NULL::BIGINT AS n_patients
+            NULL::BIGINT AS n_patients,
+            t0_rule
         FROM step_final
 
         -- RECORD 1 : Attrition (patients ayant au moins une date passant l'étape)
         UNION ALL
-        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(DISTINCT person_id)::BIGINT FROM target_exposures
+        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(DISTINCT person_id)::BIGINT, NULL::VARCHAR FROM target_exposures
         UNION ALL
-        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(DISTINCT person_id)::BIGINT FROM obs_ok
+        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(DISTINCT person_id)::BIGINT, NULL::VARCHAR FROM obs_ok
         UNION ALL
-        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(DISTINCT person_id)::BIGINT FROM wo_ok
+        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(DISTINCT person_id)::BIGINT, NULL::VARCHAR FROM wo_ok
         UNION ALL
-        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(*)::BIGINT FROM step_final
+        SELECT 1::TINYINT, NULL::BIGINT, NULL::DATE, NULL::DATE, NULL::DATE, NULL::INTEGER, NULL::INTEGER, NULL::BOOLEAN, NULL::BIGINT, COUNT(*)::BIGINT, NULL::VARCHAR FROM step_final
         {de_facto_select};
         """
 
@@ -402,6 +450,7 @@ class CohortExtractor:
             "history_days_prior",
             "follow_up_days",
             "has_12m_followup",
+            "t0_rule",
         ])
         .sort(["person_id", "t0"])
     )
@@ -442,6 +491,7 @@ class CohortExtractor:
         "history_days_prior",
         "follow_up_days",
         "has_12m_followup",
+        "t0_rule",
     ]
 
     valid_cohorts = []
@@ -455,7 +505,9 @@ class CohortExtractor:
         for r in pts:
           key = (r["person_id"], r["t0"])
           sources.setdefault(key, set()).add(r["source_id"])
-          rows.setdefault(key, r)
+          # Règle la plus faible retenue si les deux passes diffèrent
+          if key not in rows or r["t0_rule"] == "persistence":
+            rows[key] = r
         valid_keys = [k for k, s in sources.items() if {ing_a, ing_b} <= s]
         if valid_keys:
           parts.append(
@@ -474,10 +526,14 @@ class CohortExtractor:
 
       if not parts:
         continue
+      # Un essai par patient : règle principale d'abord, puis t0 le plus précoce
       df_pts = (
           pl.concat(parts, how="vertical_relaxed")
-          .sort(["person_id", "t0", "combo_source"], descending=[False, False, True])
+          .with_columns((pl.col("t0_rule") != "t0_info").alias("_rule_rank"))
+          .sort(["person_id", "_rule_rank", "t0", "combo_source"],
+                descending=[False, False, False, True])
           .unique(subset=["person_id"], keep="first", maintain_order=True)
+          .drop("_rule_rank")
       )
       if fixed_df is None and len(df_pts) < threshold:
         continue

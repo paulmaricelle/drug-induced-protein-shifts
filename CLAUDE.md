@@ -67,7 +67,10 @@ To exercise a single drug, run `scripts/extract_cohorts.py --limit N`, run `audi
   - The **counter** always counts the target. Another new ingredient counts only if it passes the rules in `ProtocolConfig`, which use only information known at t0:
     - it is in scope (`counter_scope="systemic"`): a catalog ingredient, or an ATC4 outside `excluded_atc_prefixes` (contrast agents, allergens, IV solutions, minerals, local-use groups…). Non-catalog ingredients without any ATC are ignored;
     - it is not a short order: an "EHR order" of 1 to `short_order_max_days` (14) days with no refill is ignored;
-    - optional rules for audits: `ignore_local_routes` (non-systemic routes) and `ignore_procedural` (anesthetics N01A, curares M03A, reversal agents).
+    - it is not given only by a non-systemic route (`ignore_local_routes`), and it is not a procedural agent (`ignore_procedural`: anesthetics N01A, curares M03A, reversal agents).
+  - **Persistence extension** (`persistence_extension`). A patient with no eligible date under the rules above can still be included at the first date where the counter passes after also ignoring co-initiations that are not re-exposed in [d + 30, d + 182] days. This uses post-t0 information.
+    - Every row of `stanford_index` has `t0_rule`: `t0_info` for the primary causal anchor, `persistence` for the secondary extension.
+    - The manifest has `n_t0_info`. `n_final_stanford` counts both rules.
   - A mono cohort needs exactly one counted new ingredient (the target, as monotherapy).
   - De facto co-initiations are dates with exactly two counted new ingredients, both monotherapies. `days_supply` is empty in STARR, so the end date of EHR orders is the only prescribed-duration signal.
 

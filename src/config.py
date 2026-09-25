@@ -41,8 +41,8 @@ class ProtocolConfig:
   )
   # Ordonnance ponctuelle ignorée : durée prescrite 1..N jours sans renouvellement (0 = désactivé)
   short_order_max_days: int = 14
-  # Voies non systémiques ignorées (audit uniquement pour l'instant)
-  ignore_local_routes: bool = False
+  # Voies non systémiques ignorées
+  ignore_local_routes: bool = True
   local_route_concept_ids: tuple[int, ...] = (
       4263689,  # Topical
       40549429,  # Ocular
@@ -69,10 +69,17 @@ class ProtocolConfig:
       4233974,  # Urethral
       46270168,  # Sublesional
   )
-  # Agents strictement procéduraux ignorés (variante d'audit)
-  ignore_procedural: bool = False
+  # Agents strictement procéduraux ignorés
+  ignore_procedural: bool = True
   procedural_atc_prefixes: tuple[str, ...] = ("N01A", "M03A")
   procedural_ingredient_names: tuple[str, ...] = ("neostigmine", "sugammadex")
+
+  # Extension « persistance » (analyse secondaire, colonne t0_rule = 'persistence') :
+  # pour les patients sans date éligible selon les règles ci-dessus (t0_rule = 't0_info'),
+  # une co-initiation non réexposée dans [d + a, d + b] j est aussi ignorée. Utilise une
+  # information postérieure à t0 : à distinguer des ancrages causaux principaux.
+  persistence_extension: bool = True
+  persistence_window_days: tuple[int, int] = (30, 182)
 
 
 @dataclass(frozen=True)

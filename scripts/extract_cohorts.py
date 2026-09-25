@@ -114,10 +114,12 @@ def run_batch_extraction(
         cohort.save(paths.output_cohorts_dir)
         n_final = cohort.n_stanford
         n_12m = cohort.stanford_index.filter(pl.col("has_12m_followup")).height
+        n_main = cohort.stanford_index.filter(pl.col("t0_rule") == "t0_info").height
         status = "SAVED"
       else:
         n_final = 0
         n_12m = 0
+        n_main = 0
         status = "ZERO_PATIENT"
 
       manifest_records.append({
@@ -126,6 +128,8 @@ def run_batch_extraction(
           "kind": item.kind,
           "n_final_stanford": n_final,
           "n_with_12m_followup": n_12m,
+          # Patients ancrés par la règle principale (information connue à t0)
+          "n_t0_info": n_main,
           "extraction_time_s": round(elapsed, 3),
           "status": status,
       })
@@ -151,6 +155,7 @@ def run_batch_extraction(
         "kind": combo_cohort.kind,
         "n_final_stanford": combo_cohort.n_stanford,
         "n_with_12m_followup": idx.filter(pl.col("has_12m_followup")).height,
+        "n_t0_info": idx.filter(pl.col("t0_rule") == "t0_info").height,
         "n_fixed": idx.filter(pl.col("combo_source") == "fixed").height,
         "n_de_facto": idx.filter(pl.col("combo_source") == "de_facto").height,
         "extraction_time_s": 0.0,
