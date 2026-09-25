@@ -89,6 +89,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--force", action="store_true")
     p.add_argument("--chunk-patients", type=int, default=20000, help="Patients par lot FEMR")
     p.add_argument("--max-chunks", type=int, default=None, help="Arrêt après N lots (tests / tranches)")
+    p.add_argument("--shard", default=None,
+                   help="Répartition multi-GPU 'i/n' : ce processus ne traite que les patients"
+                        " person_id %% n == i (un processus par GPU, magasin partagé)")
     p.add_argument("--qc-max", type=int, default=2000, help="Instances par lot pour le contrôle détaillé du jour t0")
     p.add_argument("--dispatch", action="store_true", help="Redistribuer le magasin vers les cohortes")
     p.add_argument("--dispatch-only", action="store_true", help="Pas d'inférence, redistribution seule")
@@ -357,6 +360,14 @@ def main() -> None:
             if args.gpu is None:
                 sys.exit("--gpu est obligatoire pour l'inférence.")
             check_gpu(args.gpu, args.max_gpu_used_mb, args.force)
+            shard_tag = ""
+            if args.shard:
+                shard_i, shard_n = (int(x) for x in args.shard.split("/"))
+                if not 0 <= shard_i < shard_n:
+                    sys.exit(f"--shard invalide : {args.shard}")
+                todo = todo.filter((pl.col("person_id") % shard_n) == shard_i)
+                shard_tag = f"_s{shard_i}of{shard_n}"
+                print(f"Shard {shard_i}/{shard_n} : {todo.height:,} couples pour ce processus")
             todo = add_prediction_time(todo, args.anchor)
             pids = todo["person_id"].unique().sort()
             n_chunks = (len(pids) + args.chunk_patients - 1) // args.chunk_patients
@@ -368,7 +379,7 @@ def main() -> None:
                     break
                 chunk_pids = pids[i * args.chunk_patients:(i + 1) * args.chunk_patients]
                 chunk = todo.filter(pl.col("person_id").is_in(chunk_pids.implode()))
-                chunk_id = f"{run_id}_{i:05d}"
+                chunk_id = f"{run_id}{shard_tag}_{i:05d}"
                 print(f"\n--- Lot {i + 1}/{n_chunks} ({chunk_id}) : {chunk.height:,} couples, "
                       f"{len(chunk_pids):,} patients ---")
                 try:
